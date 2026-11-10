@@ -70,8 +70,10 @@ def _has_private_write_permission(path: Path) -> bool:
     mode = stat.S_IMODE(path.stat().st_mode)
     private_bits = stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP
     private_bits |= stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH
-    return bool(mode & stat.S_IWUSR) and not bool(mode & private_bits) and os.access(
-        path, os.W_OK
+    return (
+        bool(mode & stat.S_IWUSR)
+        and not bool(mode & private_bits)
+        and os.access(path, os.W_OK)
     )
 
 

@@ -143,6 +143,12 @@ class Agent:
         self.desired: dict[int, dict] = {}
         self.lock = threading.RLock()
         self.auth_servers = []
+        # A sing-box CLI probe can block in a constrained guest while the
+        # running proxy remains healthy.  Cache its result instead of
+        # spawning one probe on every poll (and potentially leaking a stuck
+        # child in the kernel's D state).
+        self._singbox_api_cache: dict[str, bool] = {}
+        self._traffic_probe_retry_after: dict[str, float] = {}
         # Ownership/mode of each managed config, captured before the first
         # replacement so a rollback can put it back exactly as the proxy core
         # expects it.
@@ -256,10 +262,43 @@ class Agent:
                     return path
         return None
 
+    def _singbox_config_has_v2ray_api(self, spec: dict) -> bool:
+        """Use the loaded config as the fast capability signal.
+
+        A running sing-box with this project-managed API block has already
+        accepted the V2Ray API configuration.  Reading that local JSON is
+        safe and immediate; invoking the binary's ``version`` command on each
+        heartbeat is not, especially inside a small Incus guest.
+        """
+        path = self._config_path(
+            spec, "sing_box_config", ["/etc/sing-box*/config.json"]
+        )
+        if path is None:
+            return False
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return False
+        experimental = config.get("experimental")
+        api = experimental.get("v2ray_api") if isinstance(experimental, dict) else None
+        return isinstance(api, dict) and isinstance(api.get("stats"), dict)
+
+    def _singbox_has_v2ray_api(self, spec: dict) -> bool:
+        if self._singbox_config_has_v2ray_api(spec):
+            return True
+        binary = str(spec.get("sing_box_binary", "sing-box"))
+        cache = getattr(self, "_singbox_api_cache", None)
+        if cache is None:
+            cache = {}
+            self._singbox_api_cache = cache
+        key = os.path.realpath(binary)
+        if key not in cache:
+            cache[key] = "with_v2ray_api" in command_output([binary, "version"])
+        return cache[key]
+
     def capabilities(self, spec: dict) -> dict:
         sing_box = str(spec.get("sing_box_binary", "sing-box"))
         hysteria = str(spec.get("hysteria_binary", "hysteria"))
-        sing_version = command_output([sing_box, "version"])
         hysteria_present = bool(shutil.which(hysteria))
         yaml_available = False
         try:
@@ -276,7 +315,7 @@ class Agent:
             "hysteria_binary": hysteria_present,
             "hysteria_yaml_adapter": yaml_available,
             "sing_box_binary": bool(shutil.which(sing_box)),
-            "vless_v2ray_api": "with_v2ray_api" in sing_version,
+            "vless_v2ray_api": self._singbox_has_v2ray_api(spec),
             "hysteria_config": bool(
                 self._config_path(
                     spec,
@@ -513,8 +552,6 @@ class Agent:
         `password` field directly.
         """
         binary = str(spec.get("sing_box_binary", "sing-box"))
-        if "with_v2ray_api" not in command_output([binary, "version"]):
-            raise RuntimeError("sing-box lacks with_v2ray_api")
         path = self._config_path(
             spec, "sing_box_config", ["/etc/sing-box*/config.json"]
         )
@@ -579,6 +616,8 @@ class Agent:
         if path.read_text(encoding="utf-8") == content:
             self.save_state()
             return
+        if not self._singbox_has_v2ray_api(spec):
+            raise RuntimeError("sing-box lacks with_v2ray_api")
         backup = self._backup_and_replace(path, content, spec)
         check = subprocess.run(
             [binary, "check", "-c", str(path)],
@@ -615,9 +654,6 @@ class Agent:
 
     def apply_vless(self, spec: dict, desired: dict) -> None:
         binary = str(spec.get("sing_box_binary", "sing-box"))
-        version = command_output([binary, "version"])
-        if "with_v2ray_api" not in version:
-            raise RuntimeError("sing-box lacks with_v2ray_api")
         path = self._config_path(
             spec, "sing_box_config", ["/etc/sing-box*/config.json"]
         )
@@ -679,6 +715,8 @@ class Agent:
         if path.read_text(encoding="utf-8") == content:
             self.save_state()
             return
+        if not self._singbox_has_v2ray_api(spec):
+            raise RuntimeError("sing-box lacks with_v2ray_api")
         backup = self._backup_and_replace(path, content, spec)
         check = subprocess.run(
             [binary, "check", "-c", str(path)],
@@ -706,13 +744,32 @@ class Agent:
         if not os.path.exists(binary):
             return []
         listen = str(spec.get("v2ray_api_listen", "127.0.0.1:10085"))
+        probe_key = f"{binary}|{listen}"
+        retry_after = getattr(self, "_traffic_probe_retry_after", {}).get(
+            probe_key, 0.0
+        )
+        if time.monotonic() < retry_after:
+            return []
         raw = command_output([binary, "-addr", listen], timeout=10)
+        retry_cache = getattr(self, "_traffic_probe_retry_after", None)
+        if retry_cache is None:
+            retry_cache = {}
+            self._traffic_probe_retry_after = retry_cache
+        if not raw.strip():
+            # Do not launch a potentially stuck helper on every poll.  A
+            # short circuit also keeps a temporary API/IO fault from
+            # multiplying D-state children on small nodes.
+            retry_cache[probe_key] = time.monotonic() + 60
+            return []
+        retry_cache.pop(probe_key, None)
         try:
             payload = json.loads(raw.strip().splitlines()[0]) if raw.strip() else {}
         except (ValueError, IndexError):
+            retry_cache[probe_key] = time.monotonic() + 60
             return []
         entries = payload.get("stats")
         if not isinstance(entries, list):
+            retry_cache[probe_key] = time.monotonic() + 60
             return []
 
         node_id = int(spec["node_id"])

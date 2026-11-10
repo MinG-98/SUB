@@ -192,9 +192,7 @@ def _result(
         else (
             "未就绪"
             if state == "unsupported"
-            else "探测中"
-            if state == "pending"
-            else "不可达"
+            else "探测中" if state == "pending" else "不可达"
         )
     )
     if state == "ok" and ms is not None:

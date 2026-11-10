@@ -59,10 +59,13 @@ def main():
             auth = f"{values['username']}:{values['password']}"
         query = parse_qs(parts.query)
         if os.environ.get("HY2_PILOT_EXPLICIT") == "1":
+            tls = {"sni": query.get("sni", [""])[0]}
+            if query.get("insecure", [""])[0].lower() in {"1", "true", "yes"}:
+                tls["insecure"] = True
             client_config = {
                 "server": f"{target_host}:{parts.port}",
                 "auth": auth,
-                "tls": {"sni": query.get("sni", [""])[0]},
+                "tls": tls,
                 "obfs": {
                     "type": query.get("obfs", [""])[0],
                     "salamander": {"password": query.get("obfs-password", [""])[0]},
