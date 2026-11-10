@@ -89,6 +89,6 @@ def test_flow_survives_window():
     outside = render_users(shut_window)
     print("window shut  ->", json.dumps(outside))
     assert len(outside) == 1, "legacy user should be gone once the window closes"
-    assert (
-        outside[0].get("flow") == "xtls-rprx-vision"
-    ), "flow was dropped after the window closed — sing-box will reject every client"
+    assert outside[0].get("flow") == "xtls-rprx-vision", (
+        "flow was dropped after the window closed — sing-box will reject every client"
+    )

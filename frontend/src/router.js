@@ -26,8 +26,12 @@ router.beforeEach(async (to) => {
     try {
       const res = await api.me();
       auth.authenticated = !!res.authenticated;
+      auth.username = res.username || "";
+      auth.role = res.role || "";
     } catch {
       auth.authenticated = false;
+      auth.username = "";
+      auth.role = "";
     }
     auth.checked = true;
   }

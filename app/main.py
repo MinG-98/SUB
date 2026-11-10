@@ -1,10 +1,13 @@
 import hashlib
 import hmac
+import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
-from datetime import timedelta, timezone
+import sqlite3
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -12,8 +15,9 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select
 
+from app.account_policy import is_expired as _is_expired
 from app.converter import parse_uri, render
 from app.credentials import (
     credential_public_dict,
@@ -23,7 +27,13 @@ from app.credentials import (
 )
 from app.latency import read_status, start_probe
 from app.models import (
+    AdminAuditLog,
+    AdminAuthState,
+    AdminLoginThrottle,
+    AdminSession,
     Allocation,
+    Announcement,
+    AnnouncementAllocation,
     CollectorRun,
     Device,
     FetchLog,
@@ -35,17 +45,22 @@ from app.models import (
     UserNodeCredential,
     make_session_factory,
     new_token,
+    utc_iso,
     utcnow,
 )
+from app.node_policy import is_real_node
 from app.proxy_adapters import (
-    SUPPORTED_NODES,
     activate_credential,
+    adapter_info,
     adapter_marker,
     adapter_ready,
     capability,
+    is_local_vless,
     node_per_user_enabled,
+    supported_node_ids,
     sync_vless_config,
 )
+from app.quota import flow_limit_reached, friend_usage
 from app.traffic import (
     CollectorError,
     collector_config,
@@ -58,18 +73,123 @@ DB_PATH = os.environ.get("SUB_APP_DB", str(BASE_DIR / "data.db"))
 ADMIN_PASSWORD = os.environ.get("SUB_APP_ADMIN_PASSWORD", "")
 SECRET_KEY = os.environ.get("SUB_APP_SECRET", "")
 PUBLIC_BASE = os.environ.get("SUB_APP_PUBLIC_BASE", "").rstrip("/")
-SESSION_MAX_AGE = 7 * 24 * 3600
+ADMIN_USERNAME = os.environ.get("SUB_APP_ADMIN_USERNAME", "admin").strip() or "admin"
+SESSION_MAX_AGE = int(os.environ.get("SUB_APP_SESSION_MAX_AGE", 8 * 3600))
+ADMIN_LOGIN_MAX_FAILURES = int(os.environ.get("SUB_APP_LOGIN_MAX_FAILURES", 8))
+ADMIN_LOGIN_WINDOW_SECONDS = int(
+    os.environ.get("SUB_APP_LOGIN_WINDOW_SECONDS", 15 * 60)
+)
+ADMIN_LOGIN_LOCKOUT_SECONDS = int(
+    os.environ.get("SUB_APP_LOGIN_LOCKOUT_SECONDS", 15 * 60)
+)
 COOKIE_NAME = "sub_app_session"
+ADMIN_CREDENTIAL_FINGERPRINT = hmac.new(
+    SECRET_KEY.encode(),
+    b"sub-app-admin-credentials:"
+    + ADMIN_USERNAME.encode()
+    + b"\0"
+    + ADMIN_PASSWORD.encode(),
+    hashlib.sha256,
+).hexdigest()
 
 if not ADMIN_PASSWORD:
     raise RuntimeError("SUB_APP_ADMIN_PASSWORD is required")
 if not SECRET_KEY:
     raise RuntimeError("SUB_APP_SECRET is required")
+if SESSION_MAX_AGE <= 0:
+    raise RuntimeError("SUB_APP_SESSION_MAX_AGE must be positive")
+if (
+    min(
+        ADMIN_LOGIN_MAX_FAILURES,
+        ADMIN_LOGIN_WINDOW_SECONDS,
+        ADMIN_LOGIN_LOCKOUT_SECONDS,
+    )
+    <= 0
+):
+    raise RuntimeError("Admin login throttle settings must be positive")
 
 Session = make_session_factory(DB_PATH)
 serializer = URLSafeTimedSerializer(SECRET_KEY, salt="sub-app-session")
+audit_logger = logging.getLogger("sub_app.admin_audit")
+
+
+def _session_version_for_config(fingerprint, session_factory=None, secret_key=None):
+    """Return a persistent auth epoch that changes whenever credentials change."""
+    factory = session_factory or Session
+    key = SECRET_KEY if secret_key is None else secret_key
+    db = factory()
+    try:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        state = db.get(AdminAuthState, 1)
+        if state is None:
+            state = AdminAuthState(
+                id=1,
+                config_fingerprint=fingerprint,
+                epoch=secrets.token_hex(32),
+            )
+            db.add(state)
+        elif not hmac.compare_digest(state.config_fingerprint, fingerprint):
+            state.config_fingerprint = fingerprint
+            state.epoch = secrets.token_hex(32)
+        epoch = state.epoch
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return hmac.new(
+        key.encode(),
+        b"sub-app-admin-session-epoch:" + fingerprint.encode() + epoch.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+ADMIN_SESSION_VERSION = _session_version_for_config(ADMIN_CREDENTIAL_FINGERPRINT)
 
 app = FastAPI(title="Sub App", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "; ".join(
+            (
+                "default-src 'self'",
+                "base-uri 'self'",
+                "connect-src 'self'",
+                "font-src 'self'",
+                "form-action 'self'",
+                "frame-ancestors 'none'",
+                "img-src 'self' data:",
+                "object-src 'none'",
+                "script-src 'self'",
+                "style-src 'self' 'unsafe-inline'",
+            )
+        ),
+    )
+    forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    if forwarded_proto.split(",", 1)[0].strip().lower() == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    if (
+        request.url.path.startswith("/api/admin/")
+        and request.url.path != "/api/admin/login"
+        and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and response.status_code < 400
+    ):
+        _record_admin_audit(request, response.status_code)
+    return response
 
 
 def get_db():
@@ -80,15 +200,127 @@ def get_db():
         db.close()
 
 
+def _admin_login_client_key(request: Request) -> str:
+    """Hash the ASGI peer address; never trust client-supplied forwarding headers."""
+
+    peer = request.client.host if request.client else ""
+    try:
+        peer = ipaddress.ip_address(peer).compressed
+    except ValueError:
+        peer = peer.strip()[:255] or "unknown"
+    return hmac.new(
+        SECRET_KEY.encode(),
+        b"sub-app-admin-login:" + peer.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def require_admin(request: Request):
     raw = request.cookies.get(COOKIE_NAME)
     if not raw:
         raise HTTPException(status_code=401, detail="未登录")
     try:
-        serializer.loads(raw, max_age=SESSION_MAX_AGE)
+        payload = serializer.loads(raw, max_age=SESSION_MAX_AGE)
     except BadSignature:
         raise HTTPException(status_code=401, detail="登录已失效")
-    return True
+    if (
+        not isinstance(payload, dict)
+        or payload.get("ok") is not True
+        or not hmac.compare_digest(
+            str(payload.get("auth_version", "")), ADMIN_SESSION_VERSION
+        )
+        or not _admin_session_is_active(payload.get("sid"))
+    ):
+        raise HTTPException(status_code=401, detail="登录已失效")
+    return payload
+
+
+def _admin_session_hash(session_id):
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return hmac.new(
+        SECRET_KEY.encode(),
+        b"sub-app-admin-session-id:" + session_id.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _admin_session_is_active(session_id):
+    session_hash = _admin_session_hash(session_id)
+    if not session_hash:
+        return False
+    db = Session()
+    try:
+        auth_state = db.get(AdminAuthState, 1)
+        if auth_state is None or not hmac.compare_digest(
+            auth_state.config_fingerprint, ADMIN_CREDENTIAL_FINGERPRINT
+        ):
+            return False
+        current_version = hmac.new(
+            SECRET_KEY.encode(),
+            b"sub-app-admin-session-epoch:"
+            + auth_state.config_fingerprint.encode()
+            + auth_state.epoch.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(current_version, ADMIN_SESSION_VERSION):
+            return False
+        return (
+            db.scalar(
+                select(AdminSession.session_hash).where(
+                    AdminSession.session_hash == session_hash,
+                    AdminSession.revoked_at.is_(None),
+                    AdminSession.expires_at > utcnow().replace(tzinfo=None),
+                )
+            )
+            is not None
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        audit_logger.exception("Could not verify administrator session")
+        raise HTTPException(503, "无法验证登录会话，请稍后重试") from exc
+    finally:
+        db.close()
+
+
+def _record_admin_audit(request: Request, status_code: int) -> None:
+    """Record successful authenticated mutations without storing request bodies."""
+    raw = request.cookies.get(COOKIE_NAME)
+    if not raw:
+        return
+    try:
+        payload = serializer.loads(raw, max_age=SESSION_MAX_AGE)
+    except BadSignature:
+        return
+    if (
+        not isinstance(payload, dict)
+        or payload.get("ok") is not True
+        or not hmac.compare_digest(
+            str(payload.get("auth_version", "")), ADMIN_SESSION_VERSION
+        )
+    ):
+        return
+
+    actor = hmac.new(
+        SECRET_KEY.encode(), b"sub-app-admin-audit:" + raw.encode(), hashlib.sha256
+    ).hexdigest()
+    db = Session()
+    try:
+        db.add(
+            AdminAuditLog(
+                actor_fingerprint=actor,
+                method=request.method,
+                path=request.url.path[:255],
+                status_code=status_code,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        audit_logger.exception("Could not write administrator audit record")
+    finally:
+        db.close()
 
 
 def client_ip(request: Request) -> str:
@@ -103,7 +335,7 @@ def client_ip(request: Request) -> str:
 def fingerprint_of(request: Request, supplied: str | None) -> str:
     if supplied:
         return hashlib.sha256(supplied.encode()).hexdigest()[:32]
-    basis = f"{request.headers.get('user-agent','')}|{client_ip(request)}"
+    basis = f"{request.headers.get('user-agent', '')}|{client_ip(request)}"
     return hashlib.sha256(basis.encode()).hexdigest()[:32]
 
 
@@ -168,49 +400,73 @@ def _reconcile_friend_credentials(db, friend: Friend):
     allocations = db.scalars(
         select(Allocation).where(Allocation.friend_id == friend.id)
     ).all()
-    wanted = {allocation.node_id for allocation in allocations}
+    wanted = {
+        allocation.node_id
+        for allocation in allocations
+        if allocation.node is not None
+        and is_real_node(allocation.node)
+        and not _is_expired(allocation.node.expires_at)
+    }
     rows = _credential_rows_for_friend(db, friend.id)
     changed_vless = False
-    if not friend.per_user_credentials or not friend.enabled:
+    if (
+        not friend.per_user_credentials
+        or not friend.enabled
+        or _is_expired(friend.expires_at)
+    ):
         for row in rows:
             if row.revoked_at is None:
                 _revoke_credential(db, row)
-                changed_vless = changed_vless or row.node_id == 11
-        if changed_vless and adapter_ready(11, db):
+                node = db.get(Node, row.node_id)
+                changed_vless = changed_vless or bool(node and is_local_vless(node))
+        local_vless = db.scalar(
+            select(Node).where(
+                Node.adapter_kind == "local_vless", Node.protocol == "vless"
+            )
+        )
+        if changed_vless and local_vless and adapter_ready(local_vless, db):
             try:
                 sync_vless_config(db)
             except Exception as exc:
                 for row in rows:
-                    if row.node_id == 11 and row.status == "revoked":
+                    row_node = db.get(Node, row.node_id)
+                    if (
+                        row_node
+                        and is_local_vless(row_node)
+                        and row.status == "revoked"
+                    ):
                         row.last_error = str(exc)[:1000]
         return rows
 
     for node_id in wanted:
         node = db.get(Node, node_id)
-        if (
-            not node
-            or node_id not in SUPPORTED_NODES
-            or not node_per_user_enabled(node)
-        ):
-            continue
-        if node.protocol != SUPPORTED_NODES[node_id]["protocol"]:
+        if not node or not adapter_info(node) or not node_per_user_enabled(node):
             continue
         row = ensure_credential(db, friend, node)
         if row.status not in {"active", "grace"} or row.revoked_at is not None:
             activate_credential(db, row)
-            changed_vless = changed_vless or node_id == 11
+            changed_vless = changed_vless or is_local_vless(node)
 
     for row in rows:
         if row.node_id not in wanted and row.revoked_at is None:
             _revoke_credential(db, row)
-            changed_vless = changed_vless or row.node_id == 11
+            row_node = db.get(Node, row.node_id)
+            changed_vless = changed_vless or bool(row_node and is_local_vless(row_node))
 
-    if changed_vless and adapter_ready(11, db):
+    local_vless = db.scalar(
+        select(Node).where(Node.adapter_kind == "local_vless", Node.protocol == "vless")
+    )
+    if changed_vless and local_vless and adapter_ready(local_vless, db):
         try:
             sync_vless_config(db)
         except Exception as exc:
             for row in _credential_rows_for_friend(db, friend.id):
-                if row.node_id == 11 and row.status in {"active", "grace"}:
+                row_node = db.get(Node, row.node_id)
+                if (
+                    row_node
+                    and is_local_vless(row_node)
+                    and row.status in {"active", "grace"}
+                ):
                     row.status = "error"
                     row.last_error = str(exc)[:1000]
 
@@ -219,11 +475,108 @@ def _reconcile_friend_credentials(db, friend: Friend):
 
 
 @app.post("/api/admin/login")
-def login(response: Response, payload: dict = Body(...)):
+def login(request: Request, response: Response, payload: dict = Body(...)):
     supplied = str(payload.get("password", ""))
-    if not hmac.compare_digest(supplied, ADMIN_PASSWORD):
-        raise HTTPException(status_code=401, detail="密码错误")
-    token = serializer.dumps({"ok": True, "ts": utcnow().isoformat()})
+    client_key = _admin_login_client_key(request)
+    now = utcnow().replace(tzinfo=None)
+    db = Session()
+    try:
+        # Serialize the check-and-update across threads and Uvicorn workers.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        db.execute(
+            delete(AdminLoginThrottle).where(
+                AdminLoginThrottle.updated_at < now - timedelta(days=1)
+            )
+        )
+        throttle = db.get(AdminLoginThrottle, client_key)
+        if throttle and throttle.blocked_until and throttle.blocked_until > now:
+            retry_after = max(
+                1, int((throttle.blocked_until - now).total_seconds()) + 1
+            )
+            db.rollback()
+            raise HTTPException(
+                status_code=429,
+                detail="登录尝试过多，请稍后重试",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        if (
+            throttle
+            and (now - throttle.window_started_at).total_seconds()
+            >= ADMIN_LOGIN_WINDOW_SECONDS
+        ):
+            throttle.failure_count = 0
+            throttle.window_started_at = now
+            throttle.blocked_until = None
+
+        if not hmac.compare_digest(supplied, ADMIN_PASSWORD):
+            if throttle is None:
+                throttle = AdminLoginThrottle(
+                    client_key=client_key,
+                    failure_count=0,
+                    window_started_at=now,
+                    updated_at=now,
+                )
+                db.add(throttle)
+            throttle.failure_count += 1
+            throttle.updated_at = now
+            if throttle.failure_count >= ADMIN_LOGIN_MAX_FAILURES:
+                throttle.blocked_until = now + timedelta(
+                    seconds=ADMIN_LOGIN_LOCKOUT_SECONDS
+                )
+            blocked_until = throttle.blocked_until
+            db.commit()
+            if blocked_until and blocked_until > now:
+                raise HTTPException(
+                    status_code=429,
+                    detail="登录尝试过多，请稍后重试",
+                    headers={"Retry-After": str(ADMIN_LOGIN_LOCKOUT_SECONDS)},
+                )
+            raise HTTPException(status_code=401, detail="密码错误")
+
+        if throttle:
+            db.delete(throttle)
+        db.commit()
+    finally:
+        db.close()
+
+    session_id = secrets.token_urlsafe(32)
+    session_hash = _admin_session_hash(session_id)
+    session_now = utcnow().replace(tzinfo=None)
+    session_db = Session()
+    try:
+        session_db.execute(
+            delete(AdminSession).where(
+                or_(
+                    AdminSession.expires_at < session_now - timedelta(days=30),
+                    AdminSession.revoked_at < session_now - timedelta(days=30),
+                )
+            )
+        )
+        session_db.add(
+            AdminSession(
+                session_hash=session_hash,
+                created_at=session_now,
+                expires_at=session_now + timedelta(seconds=SESSION_MAX_AGE),
+            )
+        )
+        session_db.commit()
+    except Exception:
+        session_db.rollback()
+        raise
+    finally:
+        session_db.close()
+
+    token = serializer.dumps(
+        {
+            "ok": True,
+            "username": ADMIN_USERNAME,
+            "role": "admin",
+            "auth_version": ADMIN_SESSION_VERSION,
+            "sid": session_id,
+            "ts": utc_iso(utcnow()),
+        }
+    )
     response.set_cookie(
         COOKIE_NAME,
         token,
@@ -232,11 +585,35 @@ def login(response: Response, payload: dict = Body(...)):
         samesite="lax",
         secure=True,
     )
-    return {"ok": True}
+    return {"ok": True, "username": ADMIN_USERNAME, "role": "admin"}
 
 
 @app.post("/api/admin/logout")
-def logout(response: Response):
+def logout(request: Request, response: Response):
+    raw = request.cookies.get(COOKIE_NAME)
+    if raw:
+        try:
+            payload = serializer.loads(raw, max_age=SESSION_MAX_AGE)
+        except BadSignature:
+            payload = None
+        session_hash = (
+            _admin_session_hash(payload.get("sid"))
+            if isinstance(payload, dict)
+            else None
+        )
+        if session_hash:
+            db = Session()
+            try:
+                current = db.get(AdminSession, session_hash)
+                if current and current.revoked_at is None:
+                    current.revoked_at = utcnow().replace(tzinfo=None)
+                    db.commit()
+            except Exception as exc:
+                db.rollback()
+                audit_logger.exception("Could not revoke administrator session")
+                raise HTTPException(503, "无法撤销登录会话，请稍后重试") from exc
+            finally:
+                db.close()
     response.delete_cookie(COOKIE_NAME)
     return {"ok": True}
 
@@ -244,8 +621,12 @@ def logout(response: Response):
 @app.get("/api/admin/me")
 def me(request: Request):
     try:
-        require_admin(request)
-        return {"authenticated": True}
+        payload = require_admin(request)
+        return {
+            "authenticated": True,
+            "username": payload.get("username") or ADMIN_USERNAME,
+            "role": payload.get("role") or "admin",
+        }
     except HTTPException:
         return {"authenticated": False}
 
@@ -254,11 +635,28 @@ def me(request: Request):
 
 
 def _iso(value):
-    if value is None:
+    return utc_iso(value)
+
+
+def _parse_expiry(value, field_name="expires_at"):
+    """Parse an API expiry as UTC; date-only values expire at end of that day."""
+    if value is None or value == "":
         return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.isoformat()
+    if not isinstance(value, str):
+        raise HTTPException(422, f"{field_name} 必须是 ISO 日期或时间")
+    try:
+        if len(value) == 10:
+            parsed_date = date.fromisoformat(value)
+            parsed = datetime.combine(parsed_date, time.max, tzinfo=timezone.utc)
+        else:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.astimezone(timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(422, f"{field_name} 必须是有效的 ISO 日期或时间") from exc
+    # SQLite stores timezone-naive UTC datetimes. Keep comparisons consistent.
+    return parsed.replace(tzinfo=None)
 
 
 def _latest_metric(db, node_id):
@@ -277,6 +675,8 @@ def _metric_dict(sample):
         return {
             "mapped": False,
             "online": None,
+            "fresh": False,
+            "stale": True,
             "last_active": None,
             "last_heartbeat": None,
             "sampled_at": None,
@@ -291,12 +691,20 @@ def _metric_dict(sample):
     collected_at = sample.collected_at
     if collected_at is not None and collected_at.tzinfo is None:
         collected_at = collected_at.replace(tzinfo=timezone.utc)
+    elif collected_at is not None:
+        collected_at = collected_at.astimezone(timezone.utc)
     delay = None
+    age_seconds = None
     if collected_at is not None:
-        delay = max(0, int((utcnow() - collected_at).total_seconds()))
+        age_seconds = (utcnow() - collected_at).total_seconds()
+        if age_seconds >= 0:
+            delay = int(age_seconds)
+    fresh = age_seconds is not None and 0 <= age_seconds <= 600
     return {
         "mapped": True,
-        "online": sample.online,
+        "online": sample.online if fresh else None,
+        "fresh": fresh,
+        "stale": not fresh,
         "last_active": _iso(sample.last_active),
         "last_heartbeat": _iso(sample.last_active),
         "sampled_at": _iso(sample.collected_at),
@@ -341,23 +749,51 @@ def _node_traffic_summary(db, node_id):
 
 def node_dict(n: Node, alloc_count: int = 0, db=None):
     parsed = parse_uri(n.uri) or {}
+    real = is_real_node(n)
     metric = _metric_dict(_latest_metric(db, n.id))
     metric["mapped"] = n.nezha_server_id is not None
     adapter = capability(n, db)
+    agent = (
+        db.scalar(select(NodeAgent).where(NodeAgent.node_id == n.id))
+        if db is not None
+        else None
+    )
     return {
         "id": n.id,
         "name": n.name,
         "protocol": n.protocol,
+        "adapter_kind": n.adapter_kind,
         "server": n.server,
         "port": parsed.get("port", 0),
+        "is_real": real,
+        "is_announcement": bool(n.is_announcement),
         "enabled": n.enabled,
         "sort_order": n.sort_order,
+        "expires_at": _iso(n.expires_at),
+        "updated_at": _iso(n.updated_at),
         "nezha_server_id": n.nezha_server_id,
-        "per_user_enabled": bool(n.per_user_enabled or adapter["ready"]),
+        "per_user_enabled": bool(n.per_user_enabled),
         "per_user_capability": adapter,
-        "allocated_to": alloc_count,
+        "agent": (
+            {
+                "status": agent.status,
+                "last_seen": _iso(agent.last_seen),
+                "rotation_pending": bool(agent.pending_token_hash),
+                "pending_last_seen": _iso(agent.pending_token_last_seen),
+            }
+            if agent
+            else None
+        ),
+        "allocated_to": alloc_count if real else 0,
         "collector": metric,
-        "traffic": _node_traffic_summary(db, n.id),
+        "traffic": (
+            _node_traffic_summary(db, n.id)
+            if n.enabled
+            else {
+                key: {"bytes_in": 0, "bytes_out": 0, "total": 0}
+                for key in ("24h", "7d", "30d")
+            }
+        ),
     }
 
 
@@ -365,12 +801,17 @@ def node_dict(n: Node, alloc_count: int = 0, db=None):
 def list_nodes(request: Request, db=Depends(get_db), _=Depends(require_admin)):
     counts = dict(
         db.execute(
-            select(Allocation.node_id, func.count(Allocation.id)).group_by(
-                Allocation.node_id
-            )
+            select(Allocation.node_id, func.count(Allocation.id))
+            .join(Node, Node.id == Allocation.node_id)
+            .where(Node.is_announcement.is_(False))
+            .group_by(Allocation.node_id)
         ).all()
     )
-    nodes = db.scalars(select(Node).order_by(Node.sort_order, Node.id)).all()
+    nodes = db.scalars(
+        select(Node)
+        .where(Node.is_announcement.is_(False))
+        .order_by(Node.sort_order, Node.id)
+    ).all()
     return [node_dict(n, counts.get(n.id, 0), db) for n in nodes]
 
 
@@ -382,7 +823,7 @@ def node_traffic(
     _=Depends(require_admin),
 ):
     node = db.get(Node, node_id)
-    if not node:
+    if not node or node.is_announcement:
         raise HTTPException(404, "节点不存在")
     days = {"24h": 1, "7d": 7, "30d": 30}.get(range)
     if days is None:
@@ -433,6 +874,8 @@ def _topology_agent_state(agent):
     last_seen = agent.last_seen
     if last_seen is not None and last_seen.tzinfo is None:
         last_seen = last_seen.replace(tzinfo=timezone.utc)
+    elif last_seen is not None:
+        last_seen = last_seen.astimezone(timezone.utc)
     online = bool(
         last_seen is not None and (utcnow() - last_seen).total_seconds() <= 180
     )
@@ -442,17 +885,6 @@ def _topology_agent_state(agent):
         "online": online,
         "last_seen": _iso(agent.last_seen),
     }
-
-
-def _topology_node_is_real(node: Node, parsed: dict) -> bool:
-    """Keep placeholders out of the management graph without guessing routes."""
-    if (node.name or "").startswith("⚠️"):
-        return False
-    host = parsed.get("host") or node.server or ""
-    port = int(parsed.get("port") or 0)
-    if node.protocol.lower() == "vless" and host == "127.0.0.1":
-        return not (port <= 3 or port >= 40000)
-    return True
 
 
 @app.get("/api/admin/overview/topology")
@@ -468,7 +900,7 @@ def overview_topology(db=Depends(get_db), _=Depends(require_admin)):
     agents = {agent.node_id: agent for agent in db.scalars(select(NodeAgent)).all()}
     by_friend = {}
     for friend_id, node_id in allocations:
-        by_friend.setdefault(friend_id, []).append(node_id)
+        by_friend.setdefault(friend_id, set()).add(node_id)
     nodes_by_id = {node.id: node for node in nodes}
     graph_nodes = {}
     edges = []
@@ -486,12 +918,13 @@ def overview_topology(db=Depends(get_db), _=Depends(require_admin)):
                 "node_count": 0,
             },
         )
+        friend_node_ids = set()
         for node_id in by_friend.get(friend.id, []):
             node = nodes_by_id.get(node_id)
             if node is None:
                 continue
             parsed = parse_uri(node.uri) or {}
-            if not _topology_node_is_real(node, parsed):
+            if not is_real_node(node):
                 continue
             node_name = f"节点/{node.name}"
             host = parsed.get("host") or node.server or "未知"
@@ -517,8 +950,10 @@ def overview_topology(db=Depends(get_db), _=Depends(require_admin)):
                     "node_ids": [],
                 },
             )
-            graph_nodes[friend_name]["node_count"] += 1
-            graph_nodes[server_name]["node_ids"].append(node.id)
+            friend_node_ids.add(node.id)
+            graph_nodes[friend_name]["node_count"] = len(friend_node_ids)
+            if node.id not in graph_nodes[server_name]["node_ids"]:
+                graph_nodes[server_name]["node_ids"].append(node.id)
             relation = (friend_name, node_name)
             if relation not in seen_relations:
                 edges.append(
@@ -561,7 +996,31 @@ def overview_topology(db=Depends(get_db), _=Depends(require_admin)):
     }
 
 
+COLLECTOR_STALE_AFTER_SECONDS = 15 * 60
+
+
+def _with_status_freshness(payload):
+    """Decorate a timer status file with a conservative 15-minute age check."""
+    result = dict(payload) if isinstance(payload, dict) else {"status": "invalid"}
+    raw_at = result.get("at") or result.get("finished_at") or result.get("started_at")
+    age_seconds = None
+    if raw_at:
+        try:
+            checked_at = datetime.fromisoformat(str(raw_at).replace("Z", "+00:00"))
+            if checked_at.tzinfo is None:
+                checked_at = checked_at.replace(tzinfo=timezone.utc)
+            age = (utcnow() - checked_at.astimezone(timezone.utc)).total_seconds()
+            if age >= 0:
+                age_seconds = int(age)
+        except ValueError:
+            pass
+    result["age_seconds"] = age_seconds
+    result["stale"] = age_seconds is None or age_seconds > COLLECTOR_STALE_AFTER_SECONDS
+    return result
+
+
 def _collector_status(db):
+    sqlite_status = _sqlite_runtime_status(sqlite3.sqlite_version)
     proxy_status_path = Path(
         os.environ.get(
             "SUB_APP_PROXY_STATUS", "/var/lib/sub-app/proxy-collector-status.json"
@@ -573,15 +1032,17 @@ def _collector_status(db):
         )
     )
     try:
-        proxy_status = json.loads(proxy_status_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        proxy_status = {"status": "never_run"}
-    try:
-        reconciler_status = json.loads(
-            reconciler_status_path.read_text(encoding="utf-8")
+        proxy_status = _with_status_freshness(
+            json.loads(proxy_status_path.read_text(encoding="utf-8"))
         )
     except (FileNotFoundError, ValueError):
-        reconciler_status = {"status": "never_run"}
+        proxy_status = _with_status_freshness({"status": "never_run"})
+    try:
+        reconciler_status = _with_status_freshness(
+            json.loads(reconciler_status_path.read_text(encoding="utf-8"))
+        )
+    except (FileNotFoundError, ValueError):
+        reconciler_status = _with_status_freshness({"status": "never_run"})
     run = db.scalar(
         select(CollectorRun)
         .where(CollectorRun.source == "nezha")
@@ -604,23 +1065,45 @@ def _collector_status(db):
             "started_at": None,
             "finished_at": None,
             "last_success_at": None,
+            "age_seconds": None,
+            "stale": False,
+            **sqlite_status,
             "nodes_total": 0,
             "samples_written": 0,
             "error": "",
             "proxy": proxy_status,
             "reconciler": reconciler_status,
         }
+    run_freshness = _with_status_freshness(
+        {"status": run.status, "at": _iso(run.finished_at or run.started_at)}
+    )
     return {
         "configured": is_collector_configured(),
         "status": run.status,
         "started_at": _iso(run.started_at),
         "finished_at": _iso(run.finished_at),
         "last_success_at": _iso(last_success.finished_at) if last_success else None,
+        "age_seconds": run_freshness["age_seconds"],
+        "stale": run_freshness["stale"],
+        **sqlite_status,
         "nodes_total": run.nodes_total,
         "samples_written": run.samples_written,
         "error": run.error or "",
         "proxy": proxy_status,
         "reconciler": reconciler_status,
+    }
+
+
+def _sqlite_runtime_status(version):
+    try:
+        parsed = tuple(int(part) for part in str(version).split(".")[:3])
+        parsed = (parsed + (0, 0, 0))[:3]
+    except ValueError:
+        parsed = ()
+    fixed = parsed >= (3, 51, 3) or parsed in {(3, 50, 7), (3, 44, 6)}
+    return {
+        "sqlite_version": str(version),
+        "sqlite_wal_reset_fix": "fixed" if fixed else "verify_backport",
     }
 
 
@@ -674,16 +1157,24 @@ def create_nodes(
         raw_list.append(payload["uri"].strip())
 
     max_order = db.scalar(select(func.max(Node.sort_order))) or 0
+    seen = set()
+    for existing_node in db.scalars(select(Node)).all():
+        if existing_node.is_announcement:
+            continue
+        existing = parse_uri(existing_node.uri)
+        if existing:
+            seen.add(_node_identity(existing))
 
     for raw in raw_list:
         parsed = parse_uri(raw)
         if not parsed:
             skipped.append(raw[:60])
             continue
-        exists = db.scalar(select(Node).where(Node.uri == raw))
-        if exists:
+        identity = _node_identity(parsed)
+        if identity in seen:
             skipped.append(f"重复: {parsed.get('name') or raw[:40]}")
             continue
+        seen.add(identity)
         max_order += 1
         node = Node(
             name=payload.get("name")
@@ -701,6 +1192,22 @@ def create_nodes(
     return {"created": created, "skipped": skipped}
 
 
+def _node_identity(parsed):
+    """Canonical identity ignores display names and query-string ordering."""
+    params = dict(parsed.get("params") or {})
+    if parsed.get("scheme") == "vmess":
+        for display_key in ("ps", "remark", "remarks"):
+            params.pop(display_key, None)
+    return (
+        str(parsed.get("scheme", "")).lower(),
+        str(parsed.get("host", "")).casefold(),
+        int(parsed.get("port") or 0),
+        str(parsed.get("user", "")),
+        str(parsed.get("password", "")),
+        json.dumps(params, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
 @app.patch("/api/admin/nodes/{node_id}")
 def update_node(
     node_id: int,
@@ -711,24 +1218,82 @@ def update_node(
     node = db.get(Node, node_id)
     if not node:
         raise HTTPException(404, "节点不存在")
-    if payload.get("per_user_enabled") and not adapter_ready(node_id, db):
-        raise HTTPException(409, "该节点的代理适配器尚未就绪")
+    if node.is_announcement:
+        raise HTTPException(409, "这是已迁移的公告，请使用公告管理接口")
+    if "per_user_enabled" in payload and type(payload["per_user_enabled"]) is not bool:
+        raise HTTPException(422, "per_user_enabled 必须是布尔值")
+
+    parsed_uri = None
+    if payload.get("uri"):
+        parsed_uri = parse_uri(payload["uri"])
+        if not parsed_uri:
+            raise HTTPException(400, "无法解析该节点链接")
+    requested_kind = payload.get("adapter_kind", node.adapter_kind)
+    requested_protocol = parsed_uri["scheme"] if parsed_uri else node.protocol
+    if not isinstance(requested_kind, str):
+        raise HTTPException(422, "adapter_kind 必须是字符串")
+    if requested_kind not in {"shared", "local_hy2", "local_vless", "remote_agent"}:
+        raise HTTPException(422, "adapter_kind 不受支持")
+    candidate = Node(
+        id=node.id,
+        protocol=requested_protocol,
+        adapter_kind=requested_kind,
+    )
+    if requested_kind != "shared" and not adapter_info(candidate):
+        raise HTTPException(422, "适配器类型与节点协议不匹配")
+    if requested_kind != node.adapter_kind:
+        has_agent = db.scalar(select(NodeAgent.id).where(NodeAgent.node_id == node.id))
+        has_live_credentials = db.scalar(
+            select(UserNodeCredential.id)
+            .where(
+                UserNodeCredential.node_id == node.id,
+                UserNodeCredential.revoked_at.is_(None),
+            )
+            .limit(1)
+        )
+        if has_agent or has_live_credentials:
+            raise HTTPException(
+                409,
+                "节点已有 Agent 或未撤销凭据，不能直接更换适配器；请先停用并完成迁移。",
+            )
+    if requested_kind in {"local_hy2", "local_vless"}:
+        conflict = db.scalar(
+            select(Node).where(Node.adapter_kind == requested_kind, Node.id != node.id)
+        )
+        if conflict:
+            raise HTTPException(409, "本机适配器类型已绑定其他节点")
+    if requested_kind == "remote_agent" and requested_kind != node.adapter_kind:
+        node.per_user_enabled = False
+    node.adapter_kind = requested_kind
+    if parsed_uri and not adapter_info(node) and node.adapter_kind != "shared":
+        raise HTTPException(422, "更新后的 URI 协议与适配器类型不匹配")
+    if (
+        payload.get("per_user_enabled") is True
+        and not node.per_user_enabled
+        and not adapter_ready(node, db)
+    ):
+        raise HTTPException(
+            409,
+            "该节点的代理适配器/Agent 尚未就绪，不能开启用户级独立凭据。"
+            "Agent 超过 180 秒未上报或未应用配置；请先恢复 Agent，"
+            "或暂不启用独立凭据。节点其他字段保存不受影响。",
+        )
     for field in (
         "name",
         "enabled",
         "sort_order",
         "nezha_server_id",
         "per_user_enabled",
+        "adapter_kind",
     ):
         if field in payload:
             setattr(node, field, payload[field])
+    if "expires_at" in payload:
+        node.expires_at = _parse_expiry(payload["expires_at"], "expires_at")
     if payload.get("uri"):
-        parsed = parse_uri(payload["uri"])
-        if not parsed:
-            raise HTTPException(400, "无法解析该节点链接")
         node.uri = payload["uri"]
-        node.protocol = parsed["scheme"]
-        node.server = parsed["host"]
+        node.protocol = parsed_uri["scheme"]
+        node.server = parsed_uri["host"]
     db.commit()
     return node_dict(node, db=db)
 
@@ -772,30 +1337,142 @@ def delete_node(node_id: int, db=Depends(get_db), _=Depends(require_admin)):
     node = db.get(Node, node_id)
     if not node:
         raise HTTPException(404, "节点不存在")
+    if node.is_announcement:
+        raise HTTPException(409, "这是已迁移的公告，请使用公告管理接口")
     db.delete(node)
     db.commit()
     return {"ok": True}
+
+
+def announcement_dict(announcement: Announcement, allocated_to: int = 0):
+    return {
+        "id": announcement.id,
+        "legacy_node_id": announcement.legacy_node_id,
+        "name": announcement.name,
+        "enabled": announcement.enabled,
+        "sort_order": announcement.sort_order,
+        "allocated_to": allocated_to,
+        "created_at": _iso(announcement.created_at),
+        "updated_at": _iso(announcement.updated_at),
+    }
+
+
+def _announcement_name(value):
+    if not isinstance(value, str):
+        raise HTTPException(422, "公告内容必须是文本")
+    name = value.strip()
+    if not name or len(name) > 160:
+        raise HTTPException(422, "公告内容长度必须为 1 到 160 个字符")
+    return name
+
+
+def _announcement_order(db, payload, current=None):
+    if "sort_order" not in payload:
+        if current is not None:
+            return current.sort_order
+        node_max = db.scalar(
+            select(func.max(Node.sort_order)).where(Node.is_announcement.is_(False))
+        )
+        announcement_max = db.scalar(select(func.max(Announcement.sort_order)))
+        return max(node_max or 0, announcement_max or 0) + 1
+    value = payload["sort_order"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HTTPException(422, "sort_order 必须是非负整数")
+    return value
+
+
+@app.get("/api/admin/announcements")
+def list_announcements(db=Depends(get_db), _=Depends(require_admin)):
+    counts = dict(
+        db.execute(
+            select(
+                AnnouncementAllocation.announcement_id,
+                func.count(AnnouncementAllocation.id),
+            ).group_by(AnnouncementAllocation.announcement_id)
+        ).all()
+    )
+    rows = db.scalars(
+        select(Announcement).order_by(Announcement.sort_order, Announcement.id)
+    ).all()
+    return [announcement_dict(row, counts.get(row.id, 0)) for row in rows]
+
+
+@app.post("/api/admin/announcements")
+def create_announcement(
+    payload: dict = Body(...), db=Depends(get_db), _=Depends(require_admin)
+):
+    name = _announcement_name(payload.get("name"))
+    enabled = payload.get("enabled", True)
+    if type(enabled) is not bool:
+        raise HTTPException(422, "enabled 必须是布尔值")
+    announcement = Announcement(
+        name=name,
+        enabled=enabled,
+        sort_order=_announcement_order(db, payload),
+    )
+    db.add(announcement)
+    db.commit()
+    return announcement_dict(announcement)
+
+
+@app.patch("/api/admin/announcements/{announcement_id}")
+def update_announcement(
+    announcement_id: int,
+    payload: dict = Body(...),
+    db=Depends(get_db),
+    _=Depends(require_admin),
+):
+    announcement = db.get(Announcement, announcement_id)
+    if not announcement:
+        raise HTTPException(404, "公告不存在")
+    if "name" in payload:
+        announcement.name = _announcement_name(payload["name"])
+    if "enabled" in payload:
+        if type(payload["enabled"]) is not bool:
+            raise HTTPException(422, "enabled 必须是布尔值")
+        announcement.enabled = payload["enabled"]
+    if "sort_order" in payload:
+        announcement.sort_order = _announcement_order(db, payload, announcement)
+    db.commit()
+    allocated_to = db.scalar(
+        select(func.count(AnnouncementAllocation.id)).where(
+            AnnouncementAllocation.announcement_id == announcement.id
+        )
+    )
+    return announcement_dict(announcement, allocated_to or 0)
+
+
+@app.delete("/api/admin/announcements/{announcement_id}")
+def delete_announcement(
+    announcement_id: int, db=Depends(get_db), _=Depends(require_admin)
+):
+    announcement = db.get(Announcement, announcement_id)
+    if not announcement:
+        raise HTTPException(404, "公告不存在")
+    assigned_count = db.scalar(
+        select(func.count(AnnouncementAllocation.id)).where(
+            AnnouncementAllocation.announcement_id == announcement.id
+        )
+    )
+    db.delete(announcement)
+    db.commit()
+    return {"ok": True, "removed_user_allocations": assigned_count or 0}
 
 
 # ---------------------------------------------------------------- friends
 
 
 def _friend_usage(db, friend_id, since=None):
-    query = select(
-        func.coalesce(func.sum(FlowRecord.bytes_in), 0),
-        func.coalesce(func.sum(FlowRecord.bytes_out), 0),
-    ).where(
-        FlowRecord.friend_id == friend_id,
-        FlowRecord.source != "nezha",
-    )
-    if since is not None:
-        query = query.where(FlowRecord.bucket >= since)
-    bytes_in, bytes_out = db.execute(query).one()
-    return {"bytes_in": int(bytes_in or 0), "bytes_out": int(bytes_out or 0)}
+    return friend_usage(db, friend_id, since=since)
 
 
 def friend_dict(
-    f: Friend, node_ids: list[int], device_count: int = 0, usage=None, db=None
+    f: Friend,
+    node_ids: list[int],
+    device_count: int = 0,
+    usage=None,
+    db=None,
+    announcement_ids: list[int] | None = None,
 ):
     base = PUBLIC_BASE or ""
     usage = usage or (
@@ -810,11 +1487,25 @@ def friend_dict(
         else ("warning" if limit and used >= limit * 0.8 else "ok")
     )
     credential_status = []
+    last_shared_fallback_nodes = 0
+    last_skipped_node_count = 0
+    last_expired_node_count = 0
     if db is not None:
         credential_status = [
             credential_public_dict(row) for row in _credential_rows_for_friend(db, f.id)
         ]
-    unsupported = [node_id for node_id in node_ids if node_id not in SUPPORTED_NODES]
+        latest_fetch = db.scalar(
+            select(FetchLog)
+            .where(FetchLog.friend_id == f.id)
+            .order_by(FetchLog.created_at.desc(), FetchLog.id.desc())
+            .limit(1)
+        )
+        if latest_fetch is not None:
+            last_shared_fallback_nodes = latest_fetch.shared_fallback_count
+            last_skipped_node_count = latest_fetch.skipped_node_count
+            last_expired_node_count = latest_fetch.expired_node_count
+    supported_ids = supported_node_ids(db)
+    unsupported = [node_id for node_id in node_ids if node_id not in supported_ids]
     return {
         "id": f.id,
         "uid": f.uid,
@@ -825,8 +1516,12 @@ def friend_dict(
         "device_limit": f.device_limit,
         "per_user_credentials": f.per_user_credentials,
         "credential_status": credential_status,
+        "last_shared_fallback_nodes": last_shared_fallback_nodes,
+        "last_skipped_node_count": last_skipped_node_count,
+        "last_expired_node_count": last_expired_node_count,
         "unsupported_node_ids": unsupported,
         "node_ids": node_ids,
+        "announcement_ids": announcement_ids or [],
         "device_count": device_count,
         "flow_used_bytes": used,
         "flow_in_bytes": usage["bytes_in"],
@@ -834,21 +1529,120 @@ def friend_dict(
         "flow_limit_bytes": limit,
         "flow_percent": round(percent, 2),
         "flow_alert": alert,
-        "created_at": f.created_at.isoformat(),
+        "expires_at": _iso(f.expires_at),
+        "updated_at": _iso(f.updated_at),
+        "created_at": _iso(f.created_at),
         "links": {
             "clash": f"{base}/sub/{f.token}?target=clash",
+            "shadowrocket": f"{base}/sub/{f.token}?target=shadowrocket",
             "v2ray": f"{base}/sub/{f.token}?target=v2ray",
         },
     }
 
 
+def _real_node_ids(db, raw_ids) -> list[int]:
+    """Validate allocation IDs before excluding legacy notice nodes."""
+
+    if not isinstance(raw_ids, list):
+        raise HTTPException(422, "node_ids 必须是节点 ID 列表")
+
+    requested: list[int] = []
+    for value in raw_ids:
+        if isinstance(value, bool):
+            raise HTTPException(422, "node_ids 只能包含正整数节点 ID")
+        if isinstance(value, int):
+            node_id = value
+        elif isinstance(value, str) and value.strip().isdecimal():
+            normalized = value.strip()
+            if len(normalized) > 19:
+                raise HTTPException(422, "node_ids 只能包含正整数节点 ID")
+            try:
+                node_id = int(normalized)
+            except ValueError:
+                raise HTTPException(422, "node_ids 只能包含正整数节点 ID") from None
+        else:
+            raise HTTPException(422, "node_ids 只能包含正整数节点 ID")
+        if node_id <= 0 or node_id > 9_223_372_036_854_775_807:
+            raise HTTPException(422, "node_ids 只能包含正整数节点 ID")
+        if node_id not in requested:
+            requested.append(node_id)
+    if not requested:
+        return []
+    nodes = db.scalars(select(Node).where(Node.id.in_(requested))).all()
+    by_id = {node.id: node for node in nodes}
+    missing = [node_id for node_id in requested if node_id not in by_id]
+    if missing:
+        raise HTTPException(422, f"节点不存在: {', '.join(map(str, missing))}")
+    return [node_id for node_id in requested if is_real_node(by_id[node_id])]
+
+
+def _friend_node_ids(db) -> dict[int, list[int]]:
+    """Return only real-node allocations, preserving allocation order."""
+
+    rows = db.execute(
+        select(Allocation.friend_id, Allocation.node_id, Node)
+        .join(Node, Node.id == Allocation.node_id)
+        .order_by(Allocation.friend_id, Allocation.node_id)
+    ).all()
+    by_friend: dict[int, list[int]] = {}
+    for friend_id, node_id, node in rows:
+        if is_real_node(node):
+            by_friend.setdefault(friend_id, []).append(node_id)
+    return by_friend
+
+
+def _friend_announcement_ids(db) -> dict[int, list[int]]:
+    rows = db.execute(
+        select(
+            AnnouncementAllocation.friend_id,
+            AnnouncementAllocation.announcement_id,
+        ).order_by(
+            AnnouncementAllocation.friend_id,
+            AnnouncementAllocation.announcement_id,
+        )
+    ).all()
+    by_friend: dict[int, list[int]] = {}
+    for friend_id, announcement_id in rows:
+        by_friend.setdefault(friend_id, []).append(announcement_id)
+    return by_friend
+
+
+def _announcement_ids(db, raw_ids) -> list[int]:
+    if not isinstance(raw_ids, list):
+        raise HTTPException(422, "announcement_ids 必须是公告 ID 列表")
+    requested: list[int] = []
+    for value in raw_ids:
+        if isinstance(value, bool):
+            raise HTTPException(422, "announcement_ids 只能包含正整数")
+        if isinstance(value, int):
+            announcement_id = value
+        elif isinstance(value, str) and value.strip().isdecimal():
+            normalized = value.strip()
+            if len(normalized) > 19:
+                raise HTTPException(422, "announcement_ids 只能包含正整数")
+            announcement_id = int(normalized)
+        else:
+            raise HTTPException(422, "announcement_ids 只能包含正整数")
+        if announcement_id <= 0 or announcement_id > 9_223_372_036_854_775_807:
+            raise HTTPException(422, "announcement_ids 只能包含正整数")
+        if announcement_id not in requested:
+            requested.append(announcement_id)
+    if not requested:
+        return []
+    existing = set(
+        db.scalars(select(Announcement.id).where(Announcement.id.in_(requested))).all()
+    )
+    missing = [value for value in requested if value not in existing]
+    if missing:
+        raise HTTPException(422, f"公告不存在: {', '.join(map(str, missing))}")
+    return requested
+
+
 @app.get("/api/admin/friends")
 def list_friends(db=Depends(get_db), _=Depends(require_admin)):
     friends = db.scalars(select(Friend).order_by(Friend.id)).all()
-    allocs = db.execute(select(Allocation.friend_id, Allocation.node_id)).all()
-    by_friend: dict[int, list[int]] = {}
-    for fid, nid in allocs:
-        by_friend.setdefault(fid, []).append(nid)
+    by_friend = _friend_node_ids(db)
+    announcements_by_friend = _friend_announcement_ids(db)
     dev_counts = dict(
         db.execute(
             select(Device.friend_id, func.count(Device.id)).group_by(Device.friend_id)
@@ -860,6 +1654,7 @@ def list_friends(db=Depends(get_db), _=Depends(require_admin)):
             by_friend.get(f.id, []),
             dev_counts.get(f.id, 0),
             db=db,
+            announcement_ids=announcements_by_friend.get(f.id, []),
         )
         for f in friends
     ]
@@ -874,24 +1669,30 @@ def create_friend(
         raise HTTPException(400, "UID 不能为空")
     if db.scalar(select(Friend).where(Friend.uid == uid)):
         raise HTTPException(400, "该 UID 已存在")
+    node_ids = _real_node_ids(db, payload.get("node_ids", []))
+    announcement_ids = _announcement_ids(db, payload.get("announcement_ids", []))
     friend = Friend(
         uid=uid,
         remark=payload.get("remark", ""),
         flow_limit_gb=int(payload.get("flow_limit_gb", 0) or 0),
         device_limit=int(payload.get("device_limit", 0) or 0),
         per_user_credentials=bool(payload.get("per_user_credentials", False)),
+        expires_at=_parse_expiry(payload.get("expires_at"), "expires_at"),
         token=new_token(),
     )
     db.add(friend)
     db.flush()
-    node_ids = [int(nid) for nid in payload.get("node_ids", [])]
     for nid in node_ids:
         if db.get(Node, nid):
             db.add(Allocation(friend_id=friend.id, node_id=nid))
+    for announcement_id in announcement_ids:
+        db.add(
+            AnnouncementAllocation(friend_id=friend.id, announcement_id=announcement_id)
+        )
     db.flush()
     _reconcile_friend_credentials(db, friend)
     db.commit()
-    return friend_dict(friend, node_ids, db=db)
+    return friend_dict(friend, node_ids, db=db, announcement_ids=announcement_ids)
 
 
 @app.patch("/api/admin/friends/{friend_id}")
@@ -905,6 +1706,15 @@ def update_friend(
     if not friend:
         raise HTTPException(404, "用户不存在")
 
+    wanted = (
+        set(_real_node_ids(db, payload["node_ids"])) if "node_ids" in payload else None
+    )
+    wanted_announcements = (
+        set(_announcement_ids(db, payload["announcement_ids"]))
+        if "announcement_ids" in payload
+        else None
+    )
+
     for field in (
         "remark",
         "enabled",
@@ -914,9 +1724,10 @@ def update_friend(
     ):
         if field in payload:
             setattr(friend, field, payload[field])
+    if "expires_at" in payload:
+        friend.expires_at = _parse_expiry(payload["expires_at"], "expires_at")
 
-    if "node_ids" in payload:
-        wanted = {int(n) for n in payload["node_ids"]}
+    if wanted is not None:
         current = {
             a.node_id: a
             for a in db.scalars(
@@ -928,19 +1739,33 @@ def update_friend(
         for nid in current.keys() - wanted:
             db.delete(current[nid])
 
+    if wanted_announcements is not None:
+        current_announcements = {
+            row.announcement_id: row
+            for row in db.scalars(
+                select(AnnouncementAllocation).where(
+                    AnnouncementAllocation.friend_id == friend_id
+                )
+            ).all()
+        }
+        for announcement_id in wanted_announcements - current_announcements.keys():
+            db.add(
+                AnnouncementAllocation(
+                    friend_id=friend_id, announcement_id=announcement_id
+                )
+            )
+        for announcement_id in current_announcements.keys() - wanted_announcements:
+            db.delete(current_announcements[announcement_id])
+
     if payload.get("rotate_token"):
         friend.token = new_token()
 
     db.flush()
     _reconcile_friend_credentials(db, friend)
     db.commit()
-    node_ids = [
-        a.node_id
-        for a in db.scalars(
-            select(Allocation).where(Allocation.friend_id == friend_id)
-        ).all()
-    ]
-    return friend_dict(friend, node_ids, db=db)
+    node_ids = _friend_node_ids(db).get(friend_id, [])
+    announcement_ids = _friend_announcement_ids(db).get(friend_id, [])
+    return friend_dict(friend, node_ids, db=db, announcement_ids=announcement_ids)
 
 
 @app.delete("/api/admin/friends/{friend_id}")
@@ -1091,7 +1916,8 @@ def revoke_credential(credential_id: int, db=Depends(get_db), _=Depends(require_
     if not row:
         raise HTTPException(404, "凭据不存在")
     _revoke_credential(db, row)
-    if row.node_id == 11 and adapter_ready(11, db):
+    row_node = db.get(Node, row.node_id)
+    if row_node and is_local_vless(row_node) and adapter_ready(row_node, db):
         try:
             sync_vless_config(db)
         except Exception as exc:
@@ -1120,6 +1946,7 @@ def _device_links(request: Request, friend: Friend, raw_token: str) -> dict:
     encoded = quote(raw_token, safe="")
     return {
         "clash": f"{base}/sub/{friend.token}?device={encoded}&target=clash",
+        "shadowrocket": f"{base}/sub/{friend.token}?device={encoded}&target=shadowrocket",
         "v2ray": f"{base}/sub/{friend.token}?device={encoded}&target=v2ray",
     }
 
@@ -1247,9 +2074,12 @@ def stats(db=Depends(get_db), _=Depends(require_admin)):
 
     per_friend = db.execute(
         select(Friend.uid, func.count(FetchLog.id))
-        .join(FetchLog, FetchLog.friend_id == Friend.id, isouter=True)
-        .where((FetchLog.created_at >= week_ago) | (FetchLog.id.is_(None)))
-        .group_by(Friend.uid)
+        .outerjoin(
+            FetchLog,
+            (FetchLog.friend_id == Friend.id) & (FetchLog.created_at >= week_ago),
+        )
+        .group_by(Friend.id, Friend.uid)
+        .order_by(Friend.id)
     ).all()
 
     recent = db.execute(
@@ -1259,8 +2089,13 @@ def stats(db=Depends(get_db), _=Depends(require_admin)):
         .limit(30)
     ).all()
 
+    real_nodes = db.scalars(select(Node).where(Node.is_announcement.is_(False))).all()
+    announcement_count = db.scalar(select(func.count(Announcement.id))) or 0
+
     return {
-        "nodes": db.scalar(select(func.count(Node.id))),
+        "nodes": len(real_nodes),
+        "nodes_total": len(real_nodes),
+        "announcement_nodes": announcement_count,
         "friends": db.scalar(select(func.count(Friend.id))),
         "devices": db.scalar(select(func.count(Device.id))),
         "fetch_24h": total_fetch_24h,
@@ -1278,7 +2113,7 @@ def stats(db=Depends(get_db), _=Depends(require_admin)):
                 "target": log.target,
                 "ip": log.ip,
                 "user_agent": (log.user_agent or "")[:60],
-                "at": log.created_at.isoformat(),
+                "at": _iso(log.created_at),
             }
             for log, uid in recent
         ],
@@ -1286,6 +2121,14 @@ def stats(db=Depends(get_db), _=Depends(require_admin)):
 
 
 # ---------------------------------------------------------------- subscription
+
+
+def _announcement_uri(name: str) -> str:
+    fragment = quote(name, safe="")
+    return (
+        "vless://00000000-0000-0000-0000-000000000000"
+        f"@127.0.0.1:1?encryption=none#{fragment}"
+    )
 
 
 @app.get("/sub/{token}")
@@ -1299,6 +2142,12 @@ def subscription(
     friend = db.scalar(select(Friend).where(Friend.token == token))
     if not friend or not friend.enabled:
         raise HTTPException(404, "订阅不存在或已停用")
+
+    if _is_expired(friend.expires_at):
+        raise HTTPException(403, "用户订阅已到期，请联系管理员续期")
+
+    if flow_limit_reached(db, friend):
+        raise HTTPException(403, "用户可计量流量配额已用完")
 
     supplied_device = (device or "").strip()
     ua = request.headers.get("user-agent", "")[:250]
@@ -1349,11 +2198,10 @@ def subscription(
     dev.last_seen = utcnow()
     dev.fetch_count += 1
 
-    db.add(
-        FetchLog(
-            friend_id=friend.id, device_id=dev.id, target=target, ip=ip, user_agent=ua
-        )
+    fetch_log = FetchLog(
+        friend_id=friend.id, device_id=dev.id, target=target, ip=ip, user_agent=ua
     )
+    db.add(fetch_log)
 
     uris = []
     allocated_nodes = db.scalars(
@@ -1362,13 +2210,49 @@ def subscription(
         .where(Allocation.friend_id == friend.id, Node.enabled.is_(True))
         .order_by(Node.sort_order, Node.id)
     ).all()
+    allocated_nodes = [node for node in allocated_nodes if is_real_node(node)]
+    allocated_announcements = db.scalars(
+        select(Announcement)
+        .join(
+            AnnouncementAllocation,
+            AnnouncementAllocation.announcement_id == Announcement.id,
+        )
+        .where(
+            AnnouncementAllocation.friend_id == friend.id,
+            Announcement.enabled.is_(True),
+        )
+        .order_by(Announcement.sort_order, Announcement.id)
+    ).all()
+    subscription_items = [
+        ((node.sort_order, node.id, 0), "node", node) for node in allocated_nodes
+    ] + [
+        (
+            (
+                announcement.sort_order,
+                announcement.legacy_node_id or announcement.id,
+                1,
+            ),
+            "announcement",
+            announcement,
+        )
+        for announcement in allocated_announcements
+    ]
+    subscription_items.sort(key=lambda row: row[0])
     skipped_nodes = []
-    for node in allocated_nodes:
+    shared_fallback_nodes = []
+    expired_nodes = []
+    for _sort_key, item_type, item in subscription_items:
+        if item_type == "announcement":
+            uris.append(_announcement_uri(item.name))
+            continue
+        node = item
+        if _is_expired(node.expires_at):
+            expired_nodes.append(node.id)
+            continue
         use_per_user = (
             friend.per_user_credentials
             and per_user_feature_enabled()
-            and node.id in SUPPORTED_NODES
-            and node.protocol == SUPPORTED_NODES[node.id]["protocol"]
+            and adapter_info(node)
             and node_per_user_enabled(node)
         )
         if not use_per_user:
@@ -1389,9 +2273,17 @@ def subscription(
             skipped_nodes.append(node.id)
             continue
         uris.append(render_credential_uri(node, row))
+    fetch_log.shared_fallback_count = len(shared_fallback_nodes)
+    fetch_log.skipped_node_count = len(skipped_nodes)
+    fetch_log.expired_node_count = len(expired_nodes)
     db.commit()
 
     if not uris:
+        if skipped_nodes:
+            raise HTTPException(
+                503,
+                "独立凭据节点尚未同步完成，已安全跳过；请等待适配器恢复并同步，或联系管理员",
+            )
         raise HTTPException(404, "尚未分配任何节点")
 
     try:
@@ -1404,9 +2296,11 @@ def subscription(
         "pragma": "no-cache",
         "profile-update-interval": "12",
         "x-sub-app-skipped-nodes": str(len(skipped_nodes)),
+        "x-sub-app-shared-fallback-nodes": str(len(shared_fallback_nodes)),
+        "x-sub-app-expired-nodes": str(len(expired_nodes)),
         "content-disposition": (
             f'attachment; filename="{friend.uid}.yaml"'
-            if target.startswith("clash")
+            if target.startswith("clash") or target == "mihomo"
             else f'attachment; filename="{friend.uid}.txt"'
         ),
     }
@@ -1443,9 +2337,11 @@ def _healthz_details(db) -> dict:
         )
     )
     try:
-        proxy_status = json.loads(status_path.read_text(encoding="utf-8"))
+        proxy_status = _with_status_freshness(
+            json.loads(status_path.read_text(encoding="utf-8"))
+        )
     except (FileNotFoundError, ValueError):
-        proxy_status = {"status": "never_run"}
+        proxy_status = _with_status_freshness({"status": "never_run"})
     collector_state = _collector_status(db)
     return {
         "ok": True,
@@ -1484,6 +2380,28 @@ def admin_healthz(db=Depends(get_db), _=Depends(require_admin)):
     """Return the detailed health snapshot to authenticated administrators."""
 
     return _healthz_details(db)
+
+
+@app.get("/api/admin/audit-logs")
+def admin_audit_logs(limit: int = 100, db=Depends(get_db), _=Depends(require_admin)):
+    if not 1 <= limit <= 250:
+        raise HTTPException(400, "limit 必须在 1 到 250 之间")
+    rows = db.scalars(
+        select(AdminAuditLog)
+        .order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": row.id,
+            "actor_fingerprint": row.actor_fingerprint,
+            "method": row.method,
+            "path": row.path,
+            "status_code": row.status_code,
+            "created_at": _iso(row.created_at),
+        }
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------- node agents

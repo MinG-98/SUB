@@ -33,6 +33,24 @@ be deployed and watched before it is allowed to touch any config.
 Prefer folding Hysteria2 into sing-box where possible: a dead agent then costs
 traffic accounting, not connectivity.
 
+## Quota and live sessions
+
+For standalone Hysteria2, once a committed traffic sample puts a user over
+quota, the center returns only that node's affected credential IDs. The Agent
+first removes those IDs from its loopback authentication cache, then uses the
+loopback Hysteria Traffic Stats API (`/online` and `/kick`) to disconnect only
+those clients. Keep the API bound to loopback and configured with a secret; the
+authentication check is what prevents Hysteria clients from reconnecting after
+a kick.
+
+Hysteria2 inside sing-box has no targeted live-session kick path in this Agent.
+The V2Ray API integration is for traffic counters; changing the sing-box user
+list follows the normal config-apply path, which restarts the shared core and
+can interrupt unrelated users. Treat zero-impact, immediate per-user quota
+enforcement on this layout as unsupported until a targeted control mechanism
+is implemented and verified. Do not mistake this limitation for a successful
+selective kick.
+
 ## Traffic accounting
 
 sing-box exposes per-user counters over the V2Ray gRPC API.  The agent does not
@@ -45,6 +63,13 @@ builds and under its own package name on others, so the helper tries both.
 Build instructions for the helper, and for a sing-box that actually exposes that
 API, are in [BUILD.md](BUILD.md) — stock sing-box releases omit
 `with_v2ray_api`, so counters are unavailable without a rebuild.
+
+Traffic samples remain in a per-node on-disk retry queue until the control plane
+acknowledges their sample keys. Heartbeats send at most 128 queued records; when
+the backlog reaches 2,048 records, the agent pauses further counter collection
+until acknowledgements bring it below that threshold. A single collection pass
+can cross the threshold, but an extended control-plane outage no longer causes
+the agent to keep collecting and growing the queue indefinitely.
 
 ## Constraints learned the hard way
 

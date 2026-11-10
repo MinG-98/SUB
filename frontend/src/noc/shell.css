@@ -12,8 +12,8 @@
 .page{flex:1;display:flex;flex-direction:column;width:100%;max-width:1440px;margin:0 auto;padding-bottom:calc(var(--tap) + var(--safe-b))}
 .note{display:flex;gap:9px;padding:11px 16px;border-bottom:1px solid var(--rule);color:var(--amber);font-size:12.5px;background:color-mix(in srgb,var(--amber) 5%,var(--bg))}
 
-/* KPI 带：完整外框，内部用发丝线切开 */
-.kpis{display:grid;grid-template-columns:repeat(2,1fr);margin:12px;border:1px solid var(--rule-2);border-radius:var(--radius-lg);overflow:hidden;background:var(--bg-2)}
+/* KPI 带：等宽格，竖发丝线切开 */
+.kpis{display:grid;grid-template-columns:repeat(2,1fr);border-bottom:1px solid var(--rule)}
 .kpi{padding:15px 16px;border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);min-width:0}
 .kpi:nth-child(2n){border-right:0}
 .kpi .lbl,.kpi .lbl-cn{display:block;margin-bottom:9px}
@@ -21,12 +21,12 @@
 .kpi .mk,.kpi .sub{font-size:12px;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
 @media(max-width:767px){.kpis>.kpi:last-child:nth-child(odd){grid-column:span 2;border-right:0}}
 
-/* 面板网格：卡片四边闭合，卡片之间留出呼吸空间 */
-.grid{display:grid;grid-template-columns:1fr;gap:12px;margin:12px}
-.p{padding:20px 16px;border:1px solid var(--rule-2);border-radius:var(--radius-lg);background:var(--bg-2);min-width:0;display:flex;flex-direction:column;gap:14px;overflow:hidden}
+/* 面板网格 */
+.grid{display:grid;grid-template-columns:1fr}
+.p{padding:20px 16px;border-bottom:1px solid var(--rule);min-width:0;display:flex;flex-direction:column;gap:14px}
 .p-hd{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--rule-2)}
 .p-hd h2{font-size:15px;font-weight:600;letter-spacing:.01em;color:var(--ink)}
-.p-ft{margin-top:auto;font-size:12.5px;line-height:1.7;color:var(--ink-3);border-top:1px solid var(--rule);padding-top:12px;text-wrap:pretty}
+.p-ft{font-size:12.5px;line-height:1.7;color:var(--ink-3);border-top:1px solid var(--rule);padding-top:12px;text-wrap:pretty}
 .p-ft a{color:var(--amber)}
 
 /* 行式列表 */
@@ -51,7 +51,6 @@
 .led-meta{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--ink-3);min-width:0}
 .led-meta em,.led-meta .n{font-style:normal;font-family:var(--m);color:var(--ink-2)}
 .led-meta span{overflow-wrap:anywhere}
-.health-list{min-width:0}
 .probe-detail{border-top:1px solid var(--rule-2)}
 .probe-detail summary{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:var(--tap);cursor:pointer;color:var(--ink-2);list-style:none}
 .probe-detail summary::-webkit-details-marker{display:none}
@@ -217,13 +216,13 @@
 @media(min-width:768px){
   .top{height:52px;padding:0 20px}
   .note{padding:12px 22px}
-  .kpis{grid-template-columns:repeat(5,1fr);margin:16px 20px 0}
+  .kpis{grid-template-columns:repeat(5,1fr)}
   .kpi{padding:16px 18px;border-bottom:0}
   .kpi .big{font-size:27px}
   .kpi:last-child{border-right:0}
   .p{padding:22px}
-  .grid{grid-template-columns:repeat(2,1fr);gap:16px;margin:16px 20px}
-  .grid>.p:nth-child(2n+1){border-right:1px solid var(--rule-2)}
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .grid>.p:nth-child(2n+1){border-right:1px solid var(--rule)}
   .w2{grid-column:span 2}
   .view-hd{padding:28px 22px}
   .entity-grid{grid-template-columns:repeat(2,minmax(0,1fr));border-left:1px solid var(--rule)}
@@ -239,8 +238,6 @@
 @media(min-width:1240px){
   .rail{display:flex;flex-direction:column;width:186px;flex:none;border-right:1px solid var(--rule);position:sticky;top:0;height:100vh;padding:18px 0}
   .p{padding:24px}
-  .kpis{margin:18px 24px 0}
-  .grid{gap:18px;margin:18px 24px}
   .brand{padding:0 18px 22px;display:flex;flex-direction:column;gap:3px}
   .brand b{font-family:var(--m);font-size:13px;letter-spacing:.22em;font-weight:500}
   .brand span{font-family:var(--m);font-size:9px;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-3)}
@@ -258,16 +255,12 @@
   .kpi:nth-child(n){border-right:1px solid var(--rule);border-bottom:0}
   .kpi:last-child{border-right:0}
   .grid{grid-template-columns:repeat(12,1fr)}
-  .grid>.p{border-right:1px solid var(--rule-2)}
+  .grid>.p{border-right:1px solid var(--rule)}
   .c4{grid-column:span 4}.c5{grid-column:span 5}.c6{grid-column:span 6}.c7{grid-column:span 7}.c8{grid-column:span 8}.c12{grid-column:span 12;border-right:0}
   .w2{grid-column:span 6}
   .ann{grid-template-columns:28px minmax(0,1fr) auto auto}
   .ann-ac{grid-column:auto;justify-content:flex-end}
-  .health-panel{grid-column:span 12;border-right:1px solid var(--rule-2)}
-  .health-list{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border-top:1px solid var(--rule);border-left:1px solid var(--rule)}
-  .health-list>.led{padding:13px 14px;border-top:0;border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);min-width:0}
-  .health-list>.led:last-child{border-right:0}
-  .health-list .led-meta{flex-direction:column;align-items:flex-start;gap:4px}
+  .health-panel{grid-column:span 4}
   .topology-panel{grid-column:span 8}
   .view-hd{padding:32px 24px}
   .node-grid{grid-template-columns:repeat(3,minmax(0,1fr))}

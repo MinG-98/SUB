@@ -1,0 +1,35 @@
+[Unit]
+Description=Sub App administration and subscription service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sub-app
+Group=sub-app
+WorkingDirectory=/opt/sub-app
+EnvironmentFile=/etc/sub-app/app.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/opt/sub-app/.venv/bin/python /opt/sub-app/scripts/check_existing_db.py
+ExecStart=/opt/sub-app/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+StateDirectory=sub-app
+StateDirectoryMode=0700
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/sub-app-vless-sync
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

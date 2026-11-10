@@ -15,9 +15,11 @@ async function submit() {
   submitting.value = true;
   error.value = "";
   try {
-    await api.login(password.value);
+    const result = await api.login(password.value);
     auth.authenticated = true;
     auth.checked = true;
+    auth.username = result?.username || "";
+    auth.role = result?.role || "";
     const redirect = route.query.redirect;
     await router.push(typeof redirect === "string" ? redirect : { name: "overview" });
   } catch (e) {
@@ -31,8 +33,8 @@ async function submit() {
 <template>
   <main class="login-screen">
     <form class="login-card" @submit.prevent="submit">
-      <div class="login-brand"><b>SUBAPP</b><span>NOC Console</span></div>
-      <span class="lbl lbl-am">Operator access</span>
+      <div class="login-brand"><b>SUBAPP</b><span>运维控制台</span></div>
+      <span class="lbl lbl-am">管理员登录</span>
       <h1 class="login-title">节点订阅管理</h1>
       <p class="login-lede">管理节点、用户、设备与流量状态。</p>
       <label class="field-label" for="pw">管理员密码</label>

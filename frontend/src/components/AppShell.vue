@@ -2,31 +2,46 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api.js";
-import { isRealNode } from "../noc/data.js";
+import { isRealNode, summarizeProbe } from "../noc/data.js";
 import { auth } from "../store.js";
 
 const route = useRoute();
 const router = useRouter();
 const navItems = [
-  { name: "overview", label: "概览", title: "Overview", icon: "overview" },
-  { name: "nodes", label: "节点", title: "Nodes", icon: "nodes" },
-  { name: "users", label: "用户", title: "Users", icon: "users" },
-  { name: "devices", label: "设备", title: "Devices", icon: "devices" },
+  { name: "overview", label: "概览", title: "概览", icon: "overview" },
+  { name: "nodes", label: "节点", title: "节点", icon: "nodes" },
+  { name: "users", label: "用户", title: "用户", icon: "users" },
+  { name: "devices", label: "设备", title: "设备", icon: "devices" },
 ];
-const current = computed(() => navItems.find((item) => item.name === route.name)?.title || "Console");
-const nodesOnline = ref(0);
-const nodesTotal = ref(0);
-const lastSync = ref("");
+const current = computed(() => navItems.find((item) => item.name === route.name)?.title || "控制台");
+const signal = ref({ monitor: null, entry: null, proxy: null, total: null, entryTotal: null, proxyTotal: null, probeAt: null, probeFresh: false, syncError: false });
+const probeLabel = computed(() => {
+  if (signal.value.syncError) return "同步失败";
+  if (!signal.value.probeAt) return "探针未完成";
+  const time = new Date(signal.value.probeAt).toLocaleTimeString("zh-CN", { hour12: false });
+  return (signal.value.probeFresh ? "探针 " : "探针陈旧 ") + time;
+});
 let timer;
 
 async function refreshSignal() {
   try {
-    const nodes = (await api.nodes()).filter(isRealNode);
-    nodesTotal.value = nodes.length;
-    nodesOnline.value = nodes.filter((node) => node.collector?.online).length;
-    lastSync.value = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    const [nodeRows, latency] = await Promise.all([api.nodes(), api.latencyStatus()]);
+    const nodes = (nodeRows || []).filter(isRealNode);
+    const enabled = nodes.filter((node) => node.enabled);
+    const probe = summarizeProbe(latency);
+    signal.value = {
+      monitor: enabled.filter((node) => node.collector?.online === true).length,
+      entry: probe.entryOk,
+      proxy: probe.proxyOk,
+      total: enabled.length,
+      entryTotal: probe.entryTotal,
+      proxyTotal: probe.proxyTotal,
+      probeAt: latency?.finished_at || null,
+      probeFresh: probe.fresh,
+      syncError: false,
+    };
   } catch {
-    lastSync.value = "同步失败";
+    signal.value = { monitor: null, entry: null, proxy: null, total: null, entryTotal: null, proxyTotal: null, probeAt: null, probeFresh: false, syncError: true };
   }
 }
 
@@ -35,6 +50,8 @@ async function logout() {
     await api.logout();
   } finally {
     auth.authenticated = false;
+    auth.username = "";
+    auth.role = "";
     router.push({ name: "login" });
   }
 }
@@ -49,7 +66,7 @@ onUnmounted(() => window.clearInterval(timer));
 <template>
   <div class="shell">
     <aside class="rail">
-      <div class="brand"><b>SUBAPP</b><span>NOC Console</span></div>
+      <div class="brand"><b>SUBAPP</b><span>运维控制台</span></div>
       <nav aria-label="主导航">
         <router-link
           v-for="item in navItems"
@@ -65,7 +82,8 @@ onUnmounted(() => window.clearInterval(timer));
         </router-link>
       </nav>
       <div class="rail-ft">
-        <span class="mk" :class="nodesOnline === nodesTotal && nodesTotal ? 'ok' : nodesOnline ? 'warn' : 'bad'">{{ nodesOnline }}/{{ nodesTotal }} 节点在线</span>
+        <span class="mk info">监控 {{ signal.monitor == null ? "—" : `${signal.monitor}/${signal.total}` }}</span>
+        <span class="lbl-cn">入口 {{ signal.entry == null ? "—" : `${signal.entry}/${signal.entryTotal}` }} · 出口 {{ signal.proxy == null ? "—" : `${signal.proxy}/${signal.proxyTotal}` }}</span>
         <button class="b b-txt" @click="logout">退出登录</button>
       </div>
     </aside>
@@ -74,8 +92,8 @@ onUnmounted(() => window.clearInterval(timer));
       <header class="top">
         <h1><span class="tick">▍</span>{{ current }}</h1>
         <div class="top-actions">
-          <span class="lbl">{{ lastSync || "—" }}</span>
-          <button class="b" aria-label="刷新节点在线状态" @click="refreshSignal">刷新</button>
+          <span class="lbl">{{ auth.username || "管理员" }} · {{ probeLabel }}</span>
+          <button class="b" aria-label="刷新节点信号" @click="refreshSignal">刷新</button>
         </div>
       </header>
       <div class="page"><slot /></div>

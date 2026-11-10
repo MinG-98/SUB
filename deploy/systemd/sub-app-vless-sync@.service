@@ -1,0 +1,30 @@
+[Unit]
+Description=Apply validated Sub App VLESS users (connection %I)
+After=local-fs.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/flock --exclusive --timeout 45 /var/lib/sub-app-vless-sync/sync.lock /usr/bin/python3 /usr/local/libexec/sub-app-vless-sync-root.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+UMask=0077
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+StateDirectory=sub-app-vless-sync
+StateDirectoryMode=0700
+ReadWritePaths=/etc/sing-box-reality

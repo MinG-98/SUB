@@ -5,18 +5,31 @@ import { api } from "../api.js";
 import { formatBytes, formatLatency, formatPercent, timeAgo } from "../format.js";
 import { pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
-import { activityByUser, healthRows, isAnnouncement, isRealNode, probeState } from "../noc/data.js";
+import { activityByUser, healthRows, probeState, summarizeProbe } from "../noc/data.js";
 
 const router = useRouter();
 const loading = ref(true);
 const error = ref("");
 const stats = ref({});
 const nodes = ref([]);
+const announcements = ref([]);
 const latency = ref({});
 const devices = ref([]);
 const collector = ref({});
 const range = ref("24h");
 const probing = ref(false);
+
+function probeTone(ok, total) {
+  if (ok == null || total == null || total === 0) return "warn";
+  if (ok === total) return "ok";
+  return ok > 0 ? "warn" : "bad";
+}
+
+function probeAgeText(probe) {
+  if (probe.running) return "探测正在运行";
+  if (probe.stale) return "结果陈旧 · " + timeAgo(latency.value.finished_at);
+  return "暂无有效探测结果";
+}
 
 const showAnnouncement = ref(false);
 const editingAnnouncement = ref(null);
@@ -33,11 +46,12 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    const [s, n, l, d, c] = await Promise.all([
-      api.stats(), api.nodes(), api.latencyStatus(), api.devices(), api.collectorStatus(),
+    const [s, n, a, l, d, c] = await Promise.all([
+      api.stats(), api.nodes(), api.announcements(), api.latencyStatus(), api.devices(), api.collectorStatus(),
     ]);
     stats.value = s || {};
     nodes.value = n || [];
+    announcements.value = a || [];
     latency.value = l || {};
     devices.value = d || [];
     collector.value = c || {};
@@ -49,12 +63,34 @@ async function load() {
 }
 
 const kpis = computed(() => {
-  const real = nodes.value.filter(isRealNode);
-  const online = real.filter((node) => node.collector?.online).length;
+  const real = nodes.value;
+  const enabled = real.filter((node) => node.enabled);
+  const monitor = enabled.filter((node) => node.collector?.online === true).length;
+  const stale = enabled.filter((node) => node.collector?.stale || node.collector?.online == null).length;
+  const probe = summarizeProbe(latency.value);
   const traffic = byteParts(stats.value.flow_24h_bytes);
+  const monitorState = monitor === enabled.length && enabled.length
+    ? "ok"
+    : stale || monitor
+      ? "warn"
+      : enabled.length
+        ? "bad"
+        : "";
   return [
-    { label: "节点总数", value: real.length, sub: `${nodes.value.length - real.length} 条备注不计入` },
-    { label: "在线节点", value: online, state: online === real.length && real.length ? "ok" : online ? "warn" : "bad", sub: `${formatPercent(real.length ? (online / real.length) * 100 : 0)} 可用` },
+    { label: "真实节点", value: real.length, sub: `${announcements.value.length} 条公告不计入` },
+    { label: "监控在线 / 启用", value: `${monitor} / ${enabled.length}`, state: monitorState, sub: `${formatPercent(enabled.length ? (monitor / enabled.length) * 100 : 0)} · ${stale} 个陈旧/未知 · 仅代表心跳` },
+    {
+      label: "入口可达",
+      value: probe.entryOk == null ? "—" : `${probe.entryOk}/${probe.entryTotal}`,
+      state: probeTone(probe.entryOk, probe.entryTotal),
+      sub: !probe.fresh ? probeAgeText(probe) : probe.entryTotal ? "协议入口探测" : "没有可测试的启用节点",
+    },
+    {
+      label: "代理出口",
+      value: probe.proxyOk == null ? "—" : `${probe.proxyOk}/${probe.proxyTotal}`,
+      state: probeTone(probe.proxyOk, probe.proxyTotal),
+      sub: !probe.fresh ? probeAgeText(probe) : probe.proxyTotal ? "完整代理链路" : "没有可测试的启用节点",
+    },
     { label: "用户数", value: stats.value.friends || 0, sub: "订阅账户" },
     { label: "24h 流量", value: traffic.num, unit: traffic.unit, sub: "代理出网" },
     { label: "24h 拉取", value: Number(stats.value.fetch_24h || 0).toLocaleString("zh-CN"), sub: "订阅请求次数" },
@@ -63,7 +99,7 @@ const kpis = computed(() => {
 
 const traffic = computed(() => {
   const key = range.value === "all" ? "30d" : range.value;
-  const rows = nodes.value.filter(isRealNode).map((node) => ({
+  const rows = nodes.value.map((node) => ({
     id: node.id,
     name: node.name,
     bytes: node.traffic?.[key]?.total ?? null,
@@ -83,32 +119,33 @@ const activity = computed(() => {
   return rows.map((row) => ({ ...row, pct: Math.max(1.5, (row.fetches / max) * 100) }));
 });
 
-function meter(label, ms, okCount, total) {
+function meter(label, ms, okCount, total, fresh = true) {
   const has = ms != null;
   return {
     label,
     ms,
     text: formatLatency(has ? ms : null),
     pct: has ? Math.min(100, (ms / 400) * 100) : 0,
-    tone: !has ? "bad" : ms < 150 ? "ok" : ms < 400 ? "warn" : "bad",
-    reachability: total != null ? `可达 ${okCount || 0}/${total}` : "",
+    tone: !fresh || total === 0 ? "warn" : !has ? "bad" : ms < 150 ? "ok" : ms < 400 ? "warn" : "bad",
+    reachability: total == null ? "" : total === 0 ? "没有可测试节点" : `可达 ${okCount || 0}/${total}`,
   };
 }
 
 const probe = computed(() => {
   const summary = latency.value.summary || {};
+  const health = summarizeProbe(latency.value);
   return {
     meters: [
-      meter("控制面", latency.value.control?.state === "ok" ? latency.value.control.ms : null),
-      meter("节点入口", summary.entry_avg_ms, summary.entry_ok, summary.nodes_total),
-      meter("代理出口", summary.proxy_avg_ms, summary.proxy_ok, summary.nodes_total),
+      meter("控制面", health.fresh && latency.value.control?.state === "ok" ? latency.value.control.ms : null, null, null, health.fresh),
+      meter("节点入口", health.fresh ? summary.entry_avg_ms : null, health.entryOk, health.entryTotal, health.fresh),
+      meter("代理出口", health.fresh ? summary.proxy_avg_ms : null, health.proxyOk, health.proxyTotal, health.fresh),
     ],
     nodes: (latency.value.nodes || []).map((node) => {
       const state = probeState(node);
       return {
         ...node,
         state,
-        tone: { connected: "ok", exit_fail: "warn", timeout: "warn", unreachable: "bad", waiting: "info", pending: "info", untested: "idle" }[state.key] || "idle",
+        tone: { connected: "ok", exit_fail: "warn", timeout: "warn", unreachable: "bad", waiting: "info", pending: "info", unsupported: "warn", untested: "idle" }[state.key] || "idle",
         ms: node.proxy?.ms ?? node.entry?.ms,
         reason: node.proxy?.reason || node.entry?.reason || "",
       };
@@ -116,7 +153,6 @@ const probe = computed(() => {
   };
 });
 
-const announcements = computed(() => nodes.value.filter(isAnnouncement));
 const health = computed(() => healthRows({ stats: stats.value, nodes: nodes.value, latency: latency.value, devices: devices.value, collector: collector.value }));
 async function runProbe() {
   if (probing.value) return;
@@ -149,15 +185,9 @@ async function saveAnnouncement() {
   announcementError.value = "";
   try {
     if (editingAnnouncement.value) {
-      await api.updateNode(editingAnnouncement.value.id, { name, enabled: announcementForm.value.enabled });
+      await api.updateAnnouncement(editingAnnouncement.value.id, { name, enabled: announcementForm.value.enabled });
     } else {
-      const uri = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none#${encodeURIComponent(name)}`;
-      await api.createNodes({ uri, name });
-      if (!announcementForm.value.enabled) {
-        const fresh = await api.nodes();
-        const created = [...fresh].reverse().find((node) => isAnnouncement(node) && node.name === name);
-        if (created) await api.updateNode(created.id, { enabled: false });
-      }
+      await api.createAnnouncement({ name, enabled: announcementForm.value.enabled });
     }
     pushToast(editingAnnouncement.value ? "备注已更新" : "备注已创建", "success");
     showAnnouncement.value = false;
@@ -171,7 +201,7 @@ async function saveAnnouncement() {
 
 async function toggleAnnouncement(node) {
   try {
-    await api.updateNode(node.id, { enabled: !node.enabled });
+    await api.updateAnnouncement(node.id, { enabled: !node.enabled });
     pushToast(node.enabled ? "已取消发布" : "已发布", "success");
     await load();
   } catch (e) {
@@ -181,11 +211,11 @@ async function toggleAnnouncement(node) {
 
 async function removeAnnouncement() {
   const node = editingAnnouncement.value;
-  if (!node || !window.confirm(`确定删除备注「${node.name}」？`)) return;
+  if (!node || !window.confirm(`确定删除公告「${node.name}」？将从 ${node.allocated_to || 0} 个用户的后续订阅中移除。`)) return;
   announcementBusy.value = true;
   try {
-    await api.deleteNode(node.id);
-    pushToast("备注已删除", "success");
+    await api.deleteAnnouncement(node.id);
+    pushToast("公告已删除", "success");
     showAnnouncement.value = false;
     await load();
   } catch (e) {
@@ -242,7 +272,7 @@ onMounted(load);
       </section>
 
       <section class="p c5" aria-labelledby="h-activity">
-        <div class="p-hd"><h2 id="h-activity">用户拉取活跃度</h2><span class="lbl">Fetch count</span></div>
+        <div class="p-hd"><h2 id="h-activity">用户拉取活跃度</h2><span class="lbl">拉取次数</span></div>
         <div v-if="activity.length" class="rows">
           <div v-for="row in activity" :key="row.uid" class="row">
             <div class="row-nm">{{ row.uid }}</div><div class="row-vl">{{ row.fetches.toLocaleString("zh-CN") }} 次</div>
@@ -280,7 +310,7 @@ onMounted(load);
         <div class="p-hd"><h2 id="h-ann">备注节点</h2><button class="b" @click="openAnnouncement()">新增</button></div>
         <div v-if="announcements.length">
           <div v-for="node in announcements" :key="node.id" class="ann">
-            <div class="ann-ic">{{ node.enabled ? "◆" : "◇" }}</div><div class="ann-nm">{{ node.name }}</div><span class="mk" :class="node.enabled ? 'ok' : 'idle'">{{ node.enabled ? "已发布" : "草稿" }}</span>
+            <div class="ann-ic">{{ node.enabled ? "◆" : "◇" }}</div><div class="ann-nm">{{ node.name }}</div><span class="lbl-cn">{{ node.allocated_to || 0 }} 用户</span><span class="mk" :class="node.enabled ? 'ok' : 'idle'">{{ node.enabled ? "已发布" : "草稿" }}</span>
             <div class="ann-ac"><button class="b" @click="openAnnouncement(node)">编辑</button><button class="b" @click="toggleAnnouncement(node)">{{ node.enabled ? "取消发布" : "发布" }}</button></div>
           </div>
         </div>

@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from sqlalchemy import select
 
-from app.models import Friend, Node, UserNodeCredential, utcnow
+from app.models import Friend, Node, UserNodeCredential, utc_iso, utcnow
 
 
 def per_user_feature_enabled() -> bool:
@@ -33,6 +33,16 @@ def _key_material() -> bytes:
 def _digest(friend_id: int, node_id: int, protocol: str, version: int) -> bytes:
     message = f"sub-app-credential:v1:{friend_id}:{node_id}:{protocol}:{version}"
     return hmac.new(_key_material(), message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def deny_all_uuid(node_id: int) -> str:
+    """Return a stable, secret-derived VLESS UUID for an unadvertised deny-all user."""
+
+    message = f"sub-app-deny-all:v1:{int(node_id)}".encode("utf-8")
+    raw = bytearray(hmac.new(_key_material(), message, hashlib.sha256).digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 def credential_values(row: UserNodeCredential) -> dict[str, str]:
@@ -107,12 +117,10 @@ def credential_public_dict(row: UserNodeCredential) -> dict:
         "credential_name": row.credential_name,
         "version": row.version,
         "status": row.status,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "rotated_at": row.rotated_at.isoformat() if row.rotated_at else None,
-        "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
-        "grace_until": row.grace_until.isoformat() if row.grace_until else None,
-        "last_synced_at": (
-            row.last_synced_at.isoformat() if row.last_synced_at else None
-        ),
+        "created_at": utc_iso(row.created_at),
+        "rotated_at": utc_iso(row.rotated_at),
+        "revoked_at": utc_iso(row.revoked_at),
+        "grace_until": utc_iso(row.grace_until),
+        "last_synced_at": utc_iso(row.last_synced_at),
         "last_error": row.last_error or "",
     }

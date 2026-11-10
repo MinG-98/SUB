@@ -1,0 +1,31 @@
+[Unit]
+Description=Create a verified Sub App SQLite backup (root-owned deployment)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/sub-app/app.env
+Environment=SUB_APP_BACKUP_DIR=/var/lib/sub-app-backup
+Environment=SUB_APP_BACKUP_RETENTION_DAYS=30
+ExecStart=/usr/bin/python3 /opt/sub-app/scripts/backup_db.py
+UMask=0077
+StateDirectory=sub-app-backup
+StateDirectoryMode=0700
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH

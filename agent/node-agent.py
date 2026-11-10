@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -21,12 +22,17 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+MAX_PENDING_TRAFFIC_RECORDS = 2048
+MAX_TRAFFIC_BATCH_RECORDS = 128
 
 # "user>>>f3n12v1>>>traffic>>>uplink" as emitted by the V2Ray stats API.
 VLESS_STAT_RE = re.compile(r"^user>>>(.+)>>>traffic>>>(uplink|downlink)$")
@@ -114,10 +120,17 @@ class AuthHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Do not forward the Agent bearer token to any redirect destination."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
 class Agent:
     def __init__(self, config: dict):
         self.config = config
-        self.endpoint = str(config.get("endpoint", "")).rstrip("/")
+        self.endpoint = self._validate_endpoint(config.get("endpoint"))
         self.interval = max(10, int(config.get("poll_seconds", 30)))
         self.state_path = Path(
             config.get("state_path", "/var/lib/sub-app-node-agent/state.json")
@@ -135,11 +148,103 @@ class Agent:
         # expects it.
         self.config_meta: dict[str, tuple[int, int, int]] = {}
 
+    @staticmethod
+    def _validate_endpoint(value) -> str:
+        """Validate the control-plane URL before any bearer token is sent."""
+        if not isinstance(value, str) or not value:
+            raise ValueError("invalid Agent endpoint: HTTPS URL required")
+        if any(
+            character.isspace()
+            or ord(character) < 0x20
+            or ord(character) == 0x7F
+            or character == "\\"
+            for character in value
+        ):
+            raise ValueError("invalid Agent endpoint: unsafe URL characters")
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("invalid Agent endpoint: malformed HTTPS URL") from exc
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or "?" in value
+            or "#" in value
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError("invalid Agent endpoint: HTTPS URL with a host required")
+        return value.rstrip("/")
+
     def node_state(self, node_id: int) -> dict:
         return self.state["nodes"].setdefault(str(node_id), {})
 
     def save_state(self):
         write_json(self.state_path, self.state)
+
+    def _deny_all_user(self, state: dict, protocol: str) -> dict:
+        """Keep a stable, private credential so an empty managed list denies access."""
+        stored = state.setdefault("deny_all_users", {})
+        if not isinstance(stored, dict):
+            stored = state["deny_all_users"] = {}
+        user = stored.get(protocol)
+        if not isinstance(user, dict) or not user.get("name"):
+            name = f"sub-app-disabled-{secrets.token_hex(8)}"
+            if protocol == "vless":
+                user = {"name": name, "uuid": str(uuid.uuid4())}
+            elif protocol == "hysteria2":
+                user = {"name": name, "password": secrets.token_urlsafe(32)}
+            else:
+                raise ValueError("unsupported deny-all protocol")
+            stored[protocol] = user
+        required = "uuid" if protocol == "vless" else "password"
+        if not user.get(required):
+            raise ValueError("incomplete deny-all credential state")
+        return copy.deepcopy(user)
+
+    def _enqueue_traffic(self, node_id: int, samples) -> list[dict]:
+        state = self.node_state(node_id)
+        pending = state.setdefault("pending_traffic", [])
+        if not isinstance(pending, list):
+            pending = state["pending_traffic"] = []
+        known = {
+            str(item.get("sample_key", ""))
+            for item in pending
+            if isinstance(item, dict) and item.get("sample_key")
+        }
+        for sample in samples if isinstance(samples, list) else []:
+            if not isinstance(sample, dict):
+                continue
+            item = copy.deepcopy(sample)
+            key = str(item.get("sample_key", ""))[:128]
+            if not key:
+                canonical = json.dumps(
+                    item, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                )
+                key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                item["sample_key"] = key
+            if key not in known:
+                pending.append(item)
+                known.add(key)
+        return copy.deepcopy(pending)
+
+    def _ack_traffic(self, node_id: int, sample_keys: list[str]) -> None:
+        state = self.node_state(node_id)
+        pending = state.get("pending_traffic", [])
+        acknowledged = {
+            str(key)[:128] for key in sample_keys if isinstance(key, str) and key
+        }
+        if isinstance(pending, list):
+            state["pending_traffic"] = [
+                item
+                for item in pending
+                if not isinstance(item, dict)
+                or str(item.get("sample_key", "")) not in acknowledged
+            ]
 
     def _config_path(self, spec: dict, key: str, candidates: list[str]) -> Path | None:
         configured = str(spec.get(key, ""))
@@ -165,6 +270,7 @@ class Agent:
             pass
         return {
             "agent_version": VERSION,
+            "managed_auth_modes": True,
             "os": os.uname().sysname if hasattr(os, "uname") else "unknown",
             "machine": os.uname().machine if hasattr(os, "uname") else "unknown",
             "hysteria_binary": hysteria_present,
@@ -216,22 +322,35 @@ class Agent:
         request = Request(
             self.endpoint + path, data=data, headers=headers, method=method
         )
-        with urlopen(request, timeout=12) as response:
+        opener = build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=12) as response:
             return json.loads(response.read(1024 * 1024).decode("utf-8"))
 
     def authenticate(self, node_id: int, auth: str) -> dict:
         with self.lock:
             desired = self.desired.get(node_id, {})
+            mode = desired.get("mode", "per_user")
+            if mode == "disabled" or desired.get("enabled") is False:
+                return {"ok": False}
             users = desired.get("users", [])
             state = self.node_state(node_id)
             for item in users:
                 if item.get("protocol") != "hysteria2":
                     continue
-                if f"{item.get('username', '')}:{item.get('password', '')}" == auth:
+                expected_auth = item.get("auth") or (
+                    f"{item.get('username', '')}:{item.get('password', '')}"
+                )
+                if expected_auth == auth:
                     return {"ok": True, "id": item.get("stats_id", "")}
             legacy_until = state.get("legacy_until", "")
-            if legacy_until and utcnow() < datetime.fromisoformat(legacy_until):
-                if auth in state.get("legacy_auth", []):
+            try:
+                legacy_deadline = datetime.fromisoformat(legacy_until)
+            except (TypeError, ValueError):
+                legacy_deadline = None
+            if legacy_deadline is not None:
+                if legacy_deadline.tzinfo is None:
+                    legacy_deadline = legacy_deadline.replace(tzinfo=timezone.utc)
+                if utcnow() < legacy_deadline and auth in state.get("legacy_auth", []):
                     return {"ok": True, "id": "legacy-shared"}
             return {"ok": False}
 
@@ -424,22 +543,36 @@ class Agent:
             state["legacy_until"] = datetime.fromtimestamp(
                 utcnow().timestamp() + 24 * 3600, timezone.utc
             ).isoformat()
-        users = []
-        if state.get("legacy_until") and utcnow() < datetime.fromisoformat(
-            state["legacy_until"]
-        ):
-            users.extend(state.get("legacy_users", []))
-        for item in desired.get("users", []):
-            # Subscriptions render hysteria2://user:pass@host and clients send
-            # that whole userinfo as the auth string, so store it intact.
-            users.append(
+        mode = desired.get("mode", "per_user")
+        if mode == "shared":
+            users = [
                 {
-                    "name": item["stats_id"],
-                    "password": f"{item.get('username', '')}:{item.get('password', '')}",
+                    "name": item.get("stats_id", ""),
+                    "password": item.get("auth")
+                    or f"{item.get('username', '')}:{item.get('password', '')}",
                 }
-            )
+                for item in desired.get("users", [])
+            ]
+        else:
+            users = []
+            if (
+                mode != "disabled"
+                and state.get("legacy_until")
+                and utcnow() < datetime.fromisoformat(state["legacy_until"])
+            ):
+                users.extend(state.get("legacy_users", []))
+            if mode != "disabled":
+                for item in desired.get("users", []):
+                    # Subscriptions render hysteria2://user:pass@host and clients
+                    # send that whole userinfo as the auth string.
+                    users.append(
+                        {
+                            "name": item["stats_id"],
+                            "password": f"{item.get('username', '')}:{item.get('password', '')}",
+                        }
+                    )
         if not users:
-            raise RuntimeError("hysteria2 users empty")
+            users.append(self._deny_all_user(state, "hysteria2"))
         inbound["users"] = users
         self._singbox_stats_section(config, spec)
         content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
@@ -510,19 +643,34 @@ class Agent:
             state["legacy_until"] = datetime.fromtimestamp(
                 state["legacy_until"], timezone.utc
             ).isoformat()
-        users = []
-        if state.get("legacy_until") and utcnow() < datetime.fromisoformat(
-            state["legacy_until"]
-        ):
-            users.extend(state.get("legacy_users", []))
-        flow = self._vless_flow(state, spec)
-        for item in desired.get("users", []):
-            entry = {"name": item["stats_id"], "uuid": item["uuid"]}
-            if flow:
-                entry["flow"] = flow
-            users.append(entry)
+        mode = desired.get("mode", "per_user")
+        if mode == "shared":
+            users = []
+            for item in desired.get("users", []):
+                entry = {
+                    "name": item.get("stats_id", ""),
+                    "uuid": item["uuid"],
+                }
+                if item.get("flow"):
+                    entry["flow"] = item["flow"]
+                users.append(entry)
+        else:
+            users = []
+            if (
+                mode != "disabled"
+                and state.get("legacy_until")
+                and utcnow() < datetime.fromisoformat(state["legacy_until"])
+            ):
+                users.extend(state.get("legacy_users", []))
+            if mode != "disabled":
+                flow = self._vless_flow(state, spec)
+                for item in desired.get("users", []):
+                    entry = {"name": item["stats_id"], "uuid": item["uuid"]}
+                    if flow:
+                        entry["flow"] = flow
+                    users.append(entry)
         if not users:
-            raise RuntimeError("VLESS users empty")
+            users.append(self._deny_all_user(state, "vless"))
         inbound["users"] = users
         self._singbox_stats_section(config, spec)
         content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
@@ -655,6 +803,97 @@ class Agent:
                 )
         return traffic
 
+    def kick_hysteria_sessions(self, spec: dict, stats_ids: list[str]) -> int:
+        """Kick only named, over-quota clients on a native Hysteria server."""
+        node_id = int(spec["node_id"])
+        port = int(spec.get("stats_port", 0) or 0)
+        secret = str(self.node_state(node_id).get("traffic_secret", ""))
+        if not port or not secret:
+            raise RuntimeError("Hysteria traffic API unavailable")
+
+        targets = sorted(
+            {
+                item
+                for item in stats_ids
+                if isinstance(item, str) and 0 < len(item) <= 128
+            }
+        )
+        if not targets:
+            return 0
+
+        headers = {"Authorization": secret, "Accept": "application/json"}
+        try:
+            request = Request(
+                f"http://127.0.0.1:{port}/online", headers=headers, method="GET"
+            )
+            with urlopen(request, timeout=5) as response:
+                online = json.loads(response.read(1024 * 1024).decode("utf-8"))
+            if not isinstance(online, dict):
+                raise RuntimeError("Hysteria online API returned invalid data")
+            targets = [
+                item
+                for item in targets
+                if type(online.get(item)) is int and online[item] > 0
+            ]
+        except HTTPError as exc:
+            # /online was added after /kick. An older server can still safely
+            # receive this exact, server-authorized list of credential IDs.
+            if exc.code != 404:
+                raise
+        if not targets:
+            return 0
+
+        payload = json.dumps(targets, separators=(",", ":")).encode("utf-8")
+        request = Request(
+            f"http://127.0.0.1:{port}/kick",
+            data=payload,
+            headers={**headers, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            response.read(65536)
+        return len(targets)
+
+    def process_quota_kicks(self, spec: dict, heartbeat: dict | None) -> int:
+        """Deny reconnects locally before asking Hysteria to close live sessions."""
+        requested = []
+        if isinstance(heartbeat, dict):
+            requested = heartbeat.get(
+                "kick_stats_ids", heartbeat.get("quota_kick_stats_ids", [])
+            )
+        if not isinstance(requested, list) or not requested:
+            return 0
+        node_id = int(spec["node_id"])
+        if spec.get("protocol") != "hysteria2" or self._singbox_engine(spec):
+            return 0
+        stats_ids = sorted(
+            {
+                item
+                for item in requested
+                if isinstance(item, str) and 0 < len(item) <= 128
+            }
+        )
+        if not stats_ids:
+            return 0
+
+        with self.lock:
+            desired = self.desired.get(node_id)
+            if isinstance(desired, dict):
+                desired["users"] = [
+                    item
+                    for item in desired.get("users", [])
+                    if item.get("stats_id") not in stats_ids
+                ]
+        try:
+            return self.kick_hysteria_sessions(spec, stats_ids)
+        except Exception as exc:
+            # Keep the agent's desired configuration status healthy; the
+            # collector/next heartbeat can retry without disclosing IDs/secrets.
+            LOG.warning(
+                "node %s quota session kick failed: %s", node_id, type(exc).__name__
+            )
+            return 0
+
     def poll_node(self, spec: dict):
         node_id = int(spec["node_id"])
         token = str(spec.get("token", ""))
@@ -666,7 +905,6 @@ class Agent:
                 self.desired[node_id] = desired
             status = "observe"
             applied = desired.get("generation", "")
-            error = ""
             if desired.get("apply"):
                 status = "ready"
                 applied = ""
@@ -680,8 +918,35 @@ class Agent:
                 else:
                     raise RuntimeError("unsupported protocol")
                 applied = desired.get("generation", "")
-            traffic = self.collect_traffic(spec)
-            self.request_json(
+            node_state = self.node_state(node_id)
+            existing = node_state.get("pending_traffic", [])
+            if not isinstance(existing, list):
+                existing = []
+            if len(existing) >= MAX_PENDING_TRAFFIC_RECORDS:
+                if not node_state.get("traffic_backpressure"):
+                    LOG.warning(
+                        "node %s traffic outbox saturated at %s records; pausing collection",
+                        node_id,
+                        len(existing),
+                    )
+                node_state["traffic_backpressure"] = True
+                new_samples = []
+            else:
+                new_samples = self.collect_traffic(spec)
+            traffic = self._enqueue_traffic(node_id, new_samples)
+            if len(traffic) >= MAX_PENDING_TRAFFIC_RECORDS:
+                if not node_state.get("traffic_backpressure"):
+                    LOG.warning(
+                        "node %s traffic outbox saturated at %s records; pausing collection",
+                        node_id,
+                        len(traffic),
+                    )
+                node_state["traffic_backpressure"] = True
+            # Counter baselines and their corresponding outbox records must
+            # reach durable state before the heartbeat can advance counters.
+            self.save_state()
+            sent_traffic = copy.deepcopy(traffic[:MAX_TRAFFIC_BATCH_RECORDS])
+            heartbeat = self.request_json(
                 "POST",
                 f"/api/agent/v1/heartbeat/{node_id}",
                 token,
@@ -690,13 +955,38 @@ class Agent:
                     "agent_version": VERSION,
                     "capabilities": self.capabilities(spec),
                     "applied_generation": applied,
-                    "traffic": traffic,
+                    "traffic": sent_traffic,
                 },
             )
+            if not isinstance(heartbeat, dict) or heartbeat.get("ok") is not True:
+                raise RuntimeError("heartbeat was not acknowledged")
+            traffic_ack = heartbeat.get("traffic_ack")
+            if isinstance(traffic_ack, list):
+                acknowledged_keys = traffic_ack
+            elif heartbeat.get("traffic_records") == len(sent_traffic):
+                # Compatibility with older servers that only exposed a batch
+                # count. Never clear a partially accepted batch on that API.
+                acknowledged_keys = [
+                    str(item.get("sample_key", ""))
+                    for item in sent_traffic
+                    if isinstance(item, dict) and item.get("sample_key")
+                ]
+            else:
+                acknowledged_keys = []
+            self._ack_traffic(node_id, acknowledged_keys)
+            remaining = self.node_state(node_id).get("pending_traffic", [])
+            if (
+                isinstance(remaining, list)
+                and len(remaining) < MAX_PENDING_TRAFFIC_RECORDS
+                and self.node_state(node_id).pop("traffic_backpressure", False)
+            ):
+                LOG.info("node %s traffic collection resumed", node_id)
+            self.save_state()
+            self.process_quota_kicks(spec, heartbeat)
         except Exception as exc:
             error = type(exc).__name__
             try:
-                self.request_json(
+                heartbeat = self.request_json(
                     "POST",
                     f"/api/agent/v1/heartbeat/{node_id}",
                     token,
@@ -708,6 +998,7 @@ class Agent:
                         "error": error,
                     },
                 )
+                self.process_quota_kicks(spec, heartbeat)
             except Exception:
                 pass
             LOG.error("node %s poll failed: %s", node_id, error)

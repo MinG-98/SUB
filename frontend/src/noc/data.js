@@ -12,9 +12,20 @@ export function healthRows(d) {
   const collectorAt = c.finished_at || c.started_at || c.last_success_at;
   const hasCollectorCounts = Number.isFinite(Number(c.nodes_total)) && Number.isFinite(Number(c.samples_written));
   const collectorCounts = hasCollectorCounts ? `已写入 ${Number(c.samples_written)}/${Number(c.nodes_total)} 个采样` : "";
+  const ageText = (status) => {
+    const age = Number(status?.age_seconds);
+    if (!Number.isFinite(age) || age < 0) return "时间未知";
+    if (age < 3600) return `${Math.floor(age / 60)} 分钟前`;
+    return `${Math.floor(age / 3600)} 小时前`;
+  };
   let collectorRow;
 
-  switch (collectorStatus) {
+  if (c.stale === true && collectorStatus !== "never_run") {
+    collectorRow = {
+      ...row("哪吒采集", null, `最近一次记录 ${ageText(c)}`, collectorAt, "陈旧"),
+      tone: "is-warn",
+    };
+  } else switch (collectorStatus) {
     case "success":
       collectorRow = row("哪吒采集", true, collectorCounts || "采集成功", collectorAt, "正常");
       break;
@@ -42,16 +53,28 @@ export function healthRows(d) {
     default:
       collectorRow = row("哪吒采集", null, "采集状态不可识别", collectorAt, "未知");
   }
+  const proxyStatus = c.proxy || {};
+  const proxyRow = proxyStatus.status === "never_run"
+    ? row("代理统计", null, "尚无运行记录", null, "未运行")
+    : proxyStatus.stale === true
+    ? { ...row("代理统计", null, `最近一次记录 ${ageText(proxyStatus)}`, proxyStatus.at, "陈旧"), tone: "is-warn" }
+    : row("代理统计", proxyStatus.status ? proxyStatus.status === "success" : null, proxyStatus.reason || "流量计数来源", proxyStatus.at);
+  const reconciler = c.reconciler || {};
+  const reconcilerRow = reconciler.status === "never_run"
+    ? row("凭据协调器", null, "尚无运行记录", null, "未运行")
+    : reconciler.stale === true
+    ? { ...row("凭据协调器", null, `最近一次记录 ${ageText(reconciler)}`, reconciler.at, "陈旧"), tone: "is-warn" }
+    : row("凭据协调器", reconciler.status ? reconciler.status === "success" : null, reconciler.error || "用户凭据状态同步", reconciler.at);
+  const sqliteNeedsVerification = c.sqlite_wal_reset_fix === "verify_backport";
+  const databaseRow = sqliteNeedsVerification
+    ? { ...row("数据库", null, `SQLite ${c.sqlite_version || "未知"}：需确认 WAL 修复回补`, null, "需核实版本"), tone: "is-warn" }
+    : row("数据库", c.database === undefined ? true : !!c.database, `SQLite ${c.sqlite_version || "版本未知"} · 读写正常`, d.latency?.finished_at);
   return [
     row("应用服务", true, "控制面响应正常", d.latency?.finished_at),
-    row("数据库", c.database === undefined ? true : !!c.database, "读写正常", d.latency?.finished_at),
+    databaseRow,
     collectorRow,
-    row(
-      "代理统计",
-      c.proxy ? c.proxy.state !== "error" : null,
-      c.proxy?.reason || "流量计数来源",
-      c.proxy?.checked_at,
-    ),
+    proxyRow,
+    reconcilerRow,
     row(
       "远端 Agent",
       agentNodes ? false : true,
@@ -73,14 +96,88 @@ export function activityByUser(devices = []) {
   return [...map.values()].sort((a, b) => b.fetches - a.fetches);
 }
 
-export const isAnnouncement = (n) => n.server === "127.0.0.1";
-export const isRealNode = (n) => n.server !== "127.0.0.1";
+export const isAnnouncement = (n) => {
+  return Boolean(n?.is_announcement);
+};
+export const isRealNode = (n) => !isAnnouncement(n);
+
+const PROBE_MAX_AGE_MS = 15 * 60 * 1000;
+
+export function summarizeProbe(latency = {}, now = Date.now()) {
+  const summary = latency?.summary || {};
+  const nodesTotal = summary.nodes_total;
+  const entryTotal = summary.entry_total ?? nodesTotal;
+  const proxyTotal = summary.proxy_total ?? nodesTotal;
+  const entryOk = summary.entry_ok;
+  const proxyOk = summary.proxy_ok;
+  const finishedAt = Date.parse(latency?.finished_at || "");
+  const ageMs = now - finishedAt;
+  const completed = latency?.status === "success" || latency?.status === "partial";
+  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  const countsValid =
+    validCount(nodesTotal) &&
+    validCount(entryTotal) &&
+    validCount(entryOk) &&
+    validCount(proxyTotal) &&
+    validCount(proxyOk) &&
+    entryTotal <= nodesTotal &&
+    proxyTotal <= nodesTotal &&
+    entryOk <= entryTotal &&
+    proxyOk <= proxyTotal;
+  const fresh =
+    completed &&
+    Number.isFinite(finishedAt) &&
+    ageMs >= 0 &&
+    ageMs <= PROBE_MAX_AGE_MS &&
+    countsValid;
+
+  return {
+    fresh,
+    stale: completed && !fresh,
+    running: latency?.status === "running",
+    finishedAt: Number.isFinite(finishedAt) ? finishedAt : null,
+    ageMs: Number.isFinite(ageMs) && ageMs >= 0 ? ageMs : null,
+    nodesTotal: fresh ? nodesTotal : null,
+    entryTotal: fresh ? entryTotal : null,
+    entryOk: fresh && entryTotal > 0 ? entryOk : null,
+    proxyTotal: fresh ? proxyTotal : null,
+    proxyOk: fresh && proxyTotal > 0 ? proxyOk : null,
+  };
+}
 
 export function nodeStatus(n) {
   if (!n.enabled) return { tone: "", text: "已停用" };
+  const probe = n.probe || {};
+  const entry = probe.entry || {};
+  const proxy = probe.proxy || {};
+  if (entry.state === "pending" || proxy.state === "pending") {
+    return { key: "probe_pending", tone: "is-info", text: "探测中" };
+  }
+  if (entry.state === "waiting_agent" || proxy.state === "waiting_agent") {
+    return { key: "waiting_agent", tone: "is-accent", text: "等待 Agent" };
+  }
+  if (entry.state === "unsupported" || proxy.state === "unsupported") {
+    return { key: "probe_unavailable", tone: "is-warn", text: "探测器未就绪/不支持" };
+  }
+  if (proxy.state === "ok") {
+    return { key: "proxy_ok", tone: "is-ok", text: "代理出口正常" };
+  }
+  if (entry.state === "ok") {
+    return { key: "entry_ok", tone: "is-warn", text: "入口可达 · 出口失败" };
+  }
+  if (entry.state && entry.state !== "ok") {
+    return { key: "entry_bad", tone: "is-bad", text: "入口不可达" };
+  }
   if (!n.collector || !n.collector.mapped) return { tone: "", text: "未接入监控" };
-  if (n.collector.online) return { tone: "is-ok", text: "在线" };
-  return { tone: "is-warn", text: "监控中 · 离线" };
+  if (n.collector.stale || n.collector.online == null) {
+    const seconds = Number(n.collector.collector_delay_seconds);
+    const age = Number.isFinite(seconds)
+      ? ` · ${Math.floor(seconds / 60)} 分钟前`
+      : "";
+    return { key: "monitor_stale", tone: "is-warn", text: `监控数据陈旧${age}` };
+  }
+  if (n.collector.online === true) return { key: "monitor_online", tone: "is-info", text: "监控在线 · 未探测" };
+  return { key: "monitor_offline", tone: "is-warn", text: "监控中 · 离线" };
 }
 
 export function probeState(node) {
@@ -89,6 +186,7 @@ export function probeState(node) {
   if (e.state === "pending" || p.state === "pending") return { key: "pending", tone: "is-info", text: "探测中" };
   if (e.state === "waiting_agent" || p.state === "waiting_agent") return { key: "waiting", tone: "is-accent", text: "等待 Agent" };
   if (!e.state && !p.state) return { key: "untested", tone: "", text: "尚未测试" };
+  if (e.state === "unsupported" || p.state === "unsupported") return { key: "unsupported", tone: "is-warn", text: "探测器未就绪/不支持" };
   if (e.state === "ok" && p.state === "ok") return { key: "connected", tone: "is-ok", text: "已连接" };
   if (e.state === "ok" && p.state !== "ok") {
     if ((p.reason || p.value || "").includes("超时")) return { key: "timeout", tone: "is-warn", text: "出口探测超时" };

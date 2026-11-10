@@ -50,6 +50,11 @@ const filtered = computed(() => {
   });
 });
 
+const deviceSummary = computed(() => ({
+  linked: devices.value.filter((device) => device.device_link_active).length,
+  legacy: devices.value.filter((device) => device.identity_source !== "device_link").length,
+}));
+
 function identityState(device) {
   if (device.device_link_active) return { tone: "info", text: "专属订阅链接" };
   if (device.identity_source === "device_link") return { tone: "bad", text: "链接已撤销" };
@@ -175,7 +180,7 @@ onMounted(load);
 
 <template>
   <header class="view-hd">
-    <div class="view-copy"><span class="lbl lbl-am">Device audit</span><h2>设备审计</h2><p>设备记录是订阅访问审计，不代表手机或电脑的硬件指纹。</p></div>
+    <div class="view-copy"><span class="lbl lbl-am">设备审计</span><h2>设备审计</h2><p>设备记录是订阅访问审计，不代表手机或电脑的硬件指纹。</p></div>
     <div class="view-actions">
       <label class="search"><span aria-hidden="true">/</span><span class="visually-hidden">搜索设备</span><input v-model="search" placeholder="搜索用户、客户端或 IP"></label>
       <button class="b b-am" @click="openCreate">创建设备链接</button>
@@ -188,7 +193,7 @@ onMounted(load);
       <button :aria-pressed="filter === 'attention'" @click="filter = 'attention'">待关注</button>
       <button :aria-pressed="filter === 'blocked'" @click="filter = 'blocked'">已封锁</button>
     </div>
-    <span class="lbl-cn">{{ filtered.length }} / {{ devices.length }} 条访问记录</span>
+    <span class="lbl-cn">{{ filtered.length }} / {{ devices.length }} 条访问记录 · 专属 {{ deviceSummary.linked }} · 旧版 {{ deviceSummary.legacy }}</span>
   </div>
 
   <div v-if="loading" class="loading-lines"><div v-for="index in 8" :key="index" class="sk sk-line"></div></div>
@@ -216,6 +221,7 @@ onMounted(load);
     <template v-if="createdLinks">
       <p class="form-hint">链接只在本次显示一次，数据库仅保存不可逆哈希。请现在复制给对应设备。</p>
       <div class="link-box"><code>{{ createdLinks.clash }}</code><button class="b" @click="copyText(createdLinks.clash, 'Clash 链接')">复制</button></div>
+      <div class="link-box"><code>{{ createdLinks.shadowrocket }}</code><button class="b" @click="copyText(createdLinks.shadowrocket, '小火箭链接')">复制小火箭</button></div>
       <div class="link-box"><code>{{ createdLinks.v2ray }}</code><button class="b" @click="copyText(createdLinks.v2ray, 'V2Ray 链接')">复制</button></div>
       <div class="modal-foot"><button class="b b-am" @click="showCreate = false">完成</button></div>
     </template>
@@ -231,6 +237,7 @@ onMounted(load);
     <template v-if="detailLinks">
       <p class="form-hint">新链接只在本次显示一次，旧链接已经失效。</p>
       <div class="link-box"><code>{{ detailLinks.clash }}</code><button class="b" @click="copyText(detailLinks.clash, 'Clash 链接')">复制</button></div>
+      <div class="link-box"><code>{{ detailLinks.shadowrocket }}</code><button class="b" @click="copyText(detailLinks.shadowrocket, '小火箭链接')">复制小火箭</button></div>
       <div class="link-box"><code>{{ detailLinks.v2ray }}</code><button class="b" @click="copyText(detailLinks.v2ray, 'V2Ray 链接')">复制</button></div>
       <div class="modal-foot"><button class="b b-am" @click="detail = null">完成</button></div>
     </template>
