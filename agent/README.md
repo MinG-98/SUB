@@ -143,6 +143,17 @@ Config shape (one entry per node on this machine):
 Omit `engine` for a standalone Hysteria2 process and give `hysteria_config`,
 `auth_port` and `stats_port` instead.
 
+For an existing native **Xray VLESS/Reality** service, use `"engine": "xray"`,
+`"xray_binary": "/usr/local/bin/xray"`, its actual `xray_config` and systemd
+`service`, and select the inbound with its **internal** `inbound_port` and/or
+`inbound_tag`. Set `v2ray_api_listen` to a free IPv4 loopback port. No sing-box
+or stats helper is required. This adapter adopts at most one pre-existing client,
+keeps it for the first 24 hours of per-user mode, validates a complete candidate
+with `xray run -test` before swapping, and leaves Reality keys and transport
+settings in place. An ambiguous inbound, a conflicting API, or an existing
+multi-user list is a stop condition; don't remove existing users to bypass it.
+Keep the Agent state and backup directories root-only.
+
 Deliberately left out of the example above: `"vless_flow": "xtls-rprx-vision"`
 is a fallback for the one case in "Constraints learned the hard way" below
 where the persisted snapshot itself has no flow to recover.  It is not a
