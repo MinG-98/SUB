@@ -14,6 +14,7 @@
 - [功能](#功能)
 - [观测与拓扑](#观测与拓扑)
 - [运维脚本与定时任务](#运维脚本与定时任务)
+- [新节点一键接入](#新节点一键接入)
 - [支持的订阅格式](#支持的订阅格式)
 - [技术栈](#技术栈)
 - [项目结构](#项目结构)
@@ -36,6 +37,7 @@
 - 通过哪吒 API 采集节点在线状态、心跳、速度和 30 天内的节点流量历史。
 - 为已适配节点维护用户级凭据状态；首批适配 Hysteria2 和 VLESS，旧凭据支持短暂兼容窗口。
 - 通过独立采集脚本读取代理核心的用户级流量，并将哪吒整机流量与用户配额统计分开。
+- 从管理机一键部署全新 Debian/Ubuntu Hy2 VPS/NAT 节点并注册 Agent；部署前只读预检，部署后核对中心心跳与应用版本。
 - 为设备生成可撤销、可轮换的专属订阅访问标识，同时保留旧版 UA/IP 设备记录用于审计。
 - 使用 SQLite 持久化数据；公开 `/healthz` 只提供最小存活状态，详细健康信息通过需要管理员登录的 `/api/admin/healthz` 查看。
 
@@ -88,6 +90,12 @@ WantedBy=timers.target
 
 节点的 `adapter_kind` 是显式持久化配置，不再以数据库自增 ID 决定适配器。新建节点默认 `shared`；管理员可在节点编辑页将其设为 `remote_agent`、`local_hy2` 或 `local_vless`，后两者分别绑定本机唯一的 HY2/VLESS 适配器。SQLite v5 迁移仅对实际存在且协议匹配的旧 ID 一次性回填，缺失或协议不匹配的记录保持 `shared`，不会新建节点或改动分配。
 
+## 新节点一键接入
+
+针对**全新的 Debian/Ubuntu VPS 或 NAT 小鸡**，可以从已验证管理机运行 `scripts/bootstrap_node.py`：先只读检查 SSH 主机身份、目标机空闲情况、TLS 材料、端口和美国控制面的健康状态；确认后加 `--apply` 安装固定摘要校验的 Hysteria2 和本项目 Agent，自动创建节点并注册 Agent。最终验收要求收到新鲜且 generation 匹配的心跳，并用本地 Hy2 认证验证控制面凭据确已下发。
+
+示例、证书/端口映射准备、失败处理和支持边界见 [新节点部署手册](deploy/NEW-NODE.md)。脚本不会接管现有 Xray/sing-box/Hy2 服务器，不会修改 SSH、系统防火墙、提供商 NAT 映射或 DNS，也**不会给新节点分配用户**。未提供 `--client` 执行公网客户端探测时，成功输出不代表公网代理链路已验证。VLESS/Xray 新机自动部署目前不支持。
+
 订阅公告使用独立的 `announcements` 与 `announcement_allocations` 表，不参与节点采集、探测、适配器和流量统计；公告仍按订阅格式输出兼容的提示条目。SQLite v14 仅迁移旧版本明确生成的固定占位 URI，并复制原有用户分配；旧 Node 行和原分配记录保留作兼容核对，不会因迁移级联删除。
 
 远程 Agent 注册使用 `POST /api/admin/agents`，明文 token 仅返回一次且响应禁止缓存；注册不会启用用户级凭据。节点侧配置需要由操作者按实际服务名、代理引擎和配置路径补齐，不能仅从订阅 URI 推断。轮换先生成 24 小时有效的观察 token，旧 token 继续有效；新 token 成功心跳后由管理员确认切换，确认后旧 token 即失效。完整节点侧字段见 [agent/README.md](agent/README.md)。
@@ -124,7 +132,10 @@ WantedBy=timers.target
 │   ├── agent_api.py   # 节点 Agent 接入
 │   ├── main.py        # FastAPI 应用、管理 API 和订阅接口
 │   └── models.py      # SQLAlchemy 数据模型
-├── scripts/           # 哪吒、代理核心和节点 Agent 的采集/同步脚本
+├── scripts/           # 采集/同步脚本与新节点一键接入入口
+├── deploy/
+│   ├── NEW-NODE.md    # 新节点准备、端口/TLS、验收和故障处理
+│   └── bootstrap_worker.py # 仅经 SSH 在目标新机运行的安装工作进程
 ├── frontend/          # 管理界面源码（Vue 3 + Vite，构建产物输出到 static/）
 ├── static/
 │   ├── index.html     # 管理界面入口（由 frontend/ 构建生成，不要手改）
