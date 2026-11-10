@@ -76,12 +76,12 @@ def test_bootstrap_against_control_plane_and_agent(tmp_path, monkeypatch):
         == 200
     )
     a = Namespace(
-        name="integration-hy2",
         public_host="bootstrap.invalid",
         public_port=28443,
         listen_port=8443,
         sni="bootstrap.invalid",
         client=None,
+        region="SG",
     )
     ctx = {}
 
@@ -143,6 +143,72 @@ def test_bootstrap_against_control_plane_and_agent(tmp_path, monkeypatch):
         node["agent"]["status"],
     ) == (True, 28443, 0, "ready")
     assert not node["per_user_enabled"]
+    db = Session()
+    try:
+        saved = db.get(Node, node["id"])
+        from app.converter import parse_uri
+
+        assert parse_uri(saved.uri)["name"] == node["name"]
+    finally:
+        db.close()
+
+
+def test_all_subscription_formats_use_managed_node_name_without_uri_fragment():
+    from urllib.parse import quote, unquote, urlsplit
+
+    from app.converter import parse_uri
+
+    name = "14｜🇸🇬 新加坡 Reality"
+    friend = Friend(uid="canonical-label-user", token="canonical-label-token")
+    node = Node(
+        name=name,
+        protocol="vless",
+        uri="vless://00000000-0000-0000-0000-000000000042@sg.example:443?security=reality",
+        server="sg.example",
+    )
+    db = Session()
+    try:
+        db.add_all([friend, node])
+        db.flush()
+        db.add(Allocation(friend_id=friend.id, node_id=node.id))
+        db.commit()
+    finally:
+        db.close()
+
+    raw = client.get(f"/sub/{friend.token}?target=raw")
+    assert raw.status_code == 200
+    assert urlsplit(raw.text).fragment == quote(name, safe="")
+    assert unquote(urlsplit(raw.text).fragment) == name
+    assert parse_uri(raw.text)["name"] == name
+
+    clash = client.get(f"/sub/{friend.token}?target=clash")
+    assert clash.status_code == 200
+    assert yaml.safe_load(clash.text)["proxies"][0]["name"] == name
+
+    for target in ("v2ray", "base64", "shadowrocket"):
+        response = client.get(f"/sub/{friend.token}?target={target}")
+        assert base64.b64decode(response.text).decode() == raw.text
+
+
+def test_user_credential_uri_uses_managed_node_name_even_if_stale_fragment():
+    from app.converter import parse_uri
+    from app.credentials import render_credential_uri
+
+    node = Node(
+        name="15｜🇸🇬 新加坡 Hy2",
+        protocol="hysteria2",
+        uri="hysteria2://shared@example.com:8443?sni=example.com#old-name",
+        server="example.com",
+    )
+    row = UserNodeCredential(
+        friend_id=7,
+        node_id=18,
+        protocol="hysteria2",
+        credential_name="u7n18v1",
+        version=1,
+        status="active",
+    )
+    assert parse_uri(render_credential_uri(node, row))["name"] == node.name
 
 
 def _seed_subscription() -> None:
@@ -731,6 +797,8 @@ def test_subscription_expiry_is_validated_and_enforced() -> None:
 
 
 def test_subscription_skips_expired_nodes_and_reports_count() -> None:
+    from app.converter import parse_uri
+
     friend = Friend(uid="node-expiry-user", token="node-expiry-token")
     expired = Node(
         name="Expired Node",
@@ -762,7 +830,7 @@ def test_subscription_skips_expired_nodes_and_reports_count() -> None:
 
     response = client.get(f"/sub/{token}?target=raw")
     assert response.status_code == 200
-    assert response.text == current.uri
+    assert parse_uri(response.text)["name"] == current.name
     assert response.headers["x-sub-app-expired-nodes"] == "1"
     db = Session()
     try:
@@ -994,7 +1062,7 @@ def test_subscription_includes_only_assigned_enabled_announcements_in_all_format
         friend_id = friend.id
         expected = [
             main_module._announcement_uri(assigned.name),
-            node.uri,
+            main_module.uri_with_name(node.uri, node.name),
         ]
     finally:
         db.close()

@@ -12,7 +12,7 @@ import base64
 
 import yaml
 
-from app.converter import parse_uri, render, to_clash_proxy
+from app.converter import parse_uri, render, to_clash_proxy, uri_with_name
 
 
 def test_hysteria2_per_user_uri_keeps_full_auth():
@@ -63,6 +63,14 @@ def test_shadowrocket_render_is_base64_uri_subscription():
 
     assert content_type.startswith("text/plain")
     assert base64.b64decode(body).decode("utf-8") == uri
+
+
+def test_managed_node_name_replaces_missing_or_old_fragment():
+    name = "14｜🇸🇬 新加坡 Reality"
+    uri = "vless://uuid@example.com:443?security=reality#old-name"
+    rendered = uri_with_name(uri, name)
+    assert parse_uri(rendered)["name"] == name
+    assert parse_uri(uri_with_name(uri.split("#")[0], name))["name"] == name
 
 
 def test_invalid_ports_and_malformed_authority_are_rejected_without_raising():

@@ -11,6 +11,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from sqlalchemy import select
 
+from app.converter import uri_with_name
 from app.models import Friend, Node, UserNodeCredential, utc_iso, utcnow
 
 
@@ -105,7 +106,10 @@ def render_credential_uri(node: Node, row: UserNodeCredential) -> str:
         netloc = f"{quote(values['username'])}:{quote(values['password'])}@{host_port}"
     else:
         raise ValueError(f"unsupported per-user protocol: {row.protocol}")
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return uri_with_name(
+        urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)),
+        node.name,
+    )
 
 
 def credential_public_dict(row: UserNodeCredential) -> dict:

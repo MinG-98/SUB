@@ -92,7 +92,7 @@ WantedBy=timers.target
 
 ## 新节点一键接入
 
-针对**全新的 Debian/Ubuntu VPS 或 NAT 小鸡**，可以从已验证管理机运行 `scripts/bootstrap_node.py`：先只读检查 SSH 主机身份、目标机空闲情况、TLS 材料、端口和美国控制面的健康状态；确认后加 `--apply` 安装固定摘要校验的 Hysteria2 和本项目 Agent，自动创建节点并注册 Agent。最终验收要求收到新鲜且 generation 匹配的心跳，并用本地 Hy2 认证验证控制面凭据确已下发。
+针对**全新的 Debian/Ubuntu VPS 或 NAT 小鸡**，可以从已验证管理机运行 `scripts/bootstrap_node.py`：先只读检查 SSH 主机身份、目标机空闲情况、TLS 材料、端口和美国控制面的健康状态；确认后加 `--apply` 安装固定摘要校验的 Hysteria2 和本项目 Agent，自动按两位序号、地区旗帜/名称和 `Hy2` 协议后缀生成规范节点名，创建节点并注册 Agent。订阅 URI 的名称始终由管理面板节点名生成，所以 Clash 与 V2Ray/小火箭订阅显示一致，即使旧 URI 缺少名称片段也不例外。最终验收要求收到新鲜且 generation 匹配的心跳，并用本地 Hy2 认证验证控制面凭据确已下发。
 
 示例、证书/端口映射准备、失败处理和支持边界见 [新节点部署手册](deploy/NEW-NODE.md)。脚本不会接管现有 Xray/sing-box/Hy2 服务器，不会修改 SSH、系统防火墙、提供商 NAT 映射或 DNS，也**不会给新节点分配用户**。未提供 `--client` 执行公网客户端探测时，成功输出不代表公网代理链路已验证。VLESS/Xray 新机自动部署目前不支持。
 

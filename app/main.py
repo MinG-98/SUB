@@ -18,7 +18,7 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from sqlalchemy import delete, func, or_, select
 
 from app.account_policy import is_expired as _is_expired
-from app.converter import parse_uri, render
+from app.converter import parse_uri, render, uri_with_name
 from app.credentials import (
     credential_public_dict,
     ensure_credential,
@@ -2256,7 +2256,7 @@ def subscription(
             and node_per_user_enabled(node)
         )
         if not use_per_user:
-            uris.append(node.uri)
+            uris.append(uri_with_name(node.uri, node.name))
             continue
         row = db.scalar(
             select(UserNodeCredential)

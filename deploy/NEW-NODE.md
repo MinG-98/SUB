@@ -17,13 +17,17 @@
 
 ```sh
 python3 scripts/bootstrap_node.py \
-  --name sg-test-hy2 --ssh-host 203.0.113.20 --ssh-port 23900 \
+  --region SG --ssh-host 203.0.113.20 --ssh-port 23900 \
   --identity "$HOME/.ssh/new_vps_key" \
   --public-host 203.0.113.20 --public-port 28443 --listen-port 8443 \
   --sni hy2.example.net \
   --cert /etc/letsencrypt/live/hy2.example.net/fullchain.pem \
   --key /etc/letsencrypt/live/hy2.example.net/privkey.pem
 ```
+
+名称由 SubApp 已有最大两位节点序号自动递增；例如线上当前最高序号是 `15`，新加坡 Hy2 会显示为 `16｜🇸🇬 新加坡 Hy2`。支持的地区代码：`DE`、`HK`、`JP`、`KR`、`MY`、`SG`、`US`。同一控制面请串行运行部署，避免两个并发新节点争用序号。
+
+订阅生成时始终把管理面板的节点名写入 URI 的标准名称片段；现有 URI 片段为空或过期，也会在 raw、V2Ray/小火箭 Base64 与 Clash/Mihomo 订阅中显示管理面板的规范名。数据库内原 URI 不会被批量改写。
 
 直连 VPS 自动签证书：用 `--acme-email ops@example.net` **替换** `--cert`、`--key`。推荐再加 `--client /实际路径/hysteria`，提供管理机可信的 Hysteria 2 客户端和 curl。这样验收会从管理机经公网 UDP 入口发送一次代理 HTTPS 请求至 `https://example.com/`；失败就隔离新节点。不传客户端，只报告“控制面/本机已验证”，**不证明**供应商 NAT、外部客户端网络或实际订阅可用。
 

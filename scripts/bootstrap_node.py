@@ -17,10 +17,19 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 CENTER = "https://sub.m1n6.uk"
+REGIONS = {
+    "DE": "🇩🇪 德国",
+    "HK": "🇭🇰 香港",
+    "JP": "🇯🇵 日本",
+    "KR": "🇰🇷 韩国",
+    "MY": "🇲🇾 马来西亚",
+    "SG": "🇸🇬 新加坡",
+    "US": "🇺🇸 美国",
+}
 
 
 def hostname(value):
@@ -107,6 +116,19 @@ def remote(a, action, **extra):
     )
 
 
+def canonical_hy2_name(nodes, region):
+    """Number new nodes globally and keep one stable region/protocol label."""
+    used = set()
+    for node in nodes:
+        match = re.match(r"^(\d{2})｜", str(node.get("name") or ""))
+        if match:
+            used.add(int(match.group(1)))
+    number = max(used, default=0) + 1
+    if number > 99:
+        raise RuntimeError("节点编号已超过 99，请先整理现有编号")
+    return f"{number:02d}｜{REGIONS[region]} Hy2"
+
+
 def wait_ready(api, node_id, previous=None, timeout=90):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -190,6 +212,8 @@ def canary(client, a, password):
 def provision(a, api):
     path = "/api/admin/nodes"
     nodes = api("GET", path)
+    a.name = canonical_hy2_name(nodes, a.region)
+    print(f"规范节点名：{a.name}", flush=True)
     if any(
         n["name"] == a.name
         or (
@@ -202,8 +226,11 @@ def provision(a, api):
         raise RuntimeError("中心已有同名或同 Hy2 端点节点；不会重复创建或接管")
     password = secrets.token_urlsafe(32)
     marker = "bootstrap-" + secrets.token_hex(12)
-    uri = f"hysteria2://{password}@{a.public_host}:{a.public_port}?" + urlencode(
-        {"sni": a.sni}
+    uri = (
+        f"hysteria2://{password}@{a.public_host}:{a.public_port}?"
+        + urlencode({"sni": a.sni})
+        + "#"
+        + quote(a.name, safe="")
     )
     node_id = None
     installing = False
@@ -286,7 +313,7 @@ def main():
     p.add_argument(
         "--acme-email", help="新域名自动签证书；公网 TCP 80 必须映射至机内 80"
     )
-    p.add_argument("--name", required=True)
+    p.add_argument("--region", choices=sorted(REGIONS), required=True)
     p.add_argument(
         "--client", type=Path, help="管理机已安装的 Hy2 客户端，用于外部拨测"
     )

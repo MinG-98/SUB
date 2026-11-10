@@ -2,11 +2,21 @@
 
 import base64
 import json
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse, urlsplit, urlunsplit
 
 import yaml
 
 SUPPORTED = ("vless", "vmess", "trojan", "hysteria2", "hy2", "ss")
+
+
+def uri_with_name(uri: str, name: str) -> str:
+    """Use the administrator-managed node name as the subscription URI label."""
+    if not str(name or "").strip():
+        return uri
+    parts = urlsplit(uri)
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, parts.query, quote(name, safe=""))
+    )
 
 
 def _b64pad(s):
