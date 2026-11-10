@@ -100,6 +100,10 @@ as a fallback.  `tests/test_flow_survives_window.py` pins this.
 
 ## Deploy
 
+For an **empty Debian/Ubuntu VPS**, use the [one-command HY2 bootstrap](../deploy/NEW-NODE.md)
+from the management computer. Existing proxies, Xray migration, and OpenRC hosts
+are deliberately outside that installer's scope. For other layouts, continue below.
+
     install -m 0755 node-agent.py /usr/local/libexec/sub-app-node-agent.py
     install -m 0600 <config>      /etc/sub-app/node-agent.json
 

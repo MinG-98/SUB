@@ -55,6 +55,96 @@ from app.models import (
 client = TestClient(app, base_url="https://testserver")
 
 
+def test_bootstrap_against_control_plane_and_agent(tmp_path, monkeypatch):
+    """Real routes + Agent poll; replace only transport, proxy daemon and SSH."""
+    import importlib.util
+    from argparse import Namespace
+
+    from scripts import bootstrap_node as boot
+
+    spec = importlib.util.spec_from_file_location(
+        "bootstrap_real_agent", boot.ROOT / "agent/node-agent.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    admin = TestClient(app, base_url="https://testserver")
+    peer = TestClient(app, base_url="https://testserver")
+    assert (
+        admin.post(
+            "/api/admin/login", json={"password": "test-admin-password"}
+        ).status_code
+        == 200
+    )
+    a = Namespace(
+        name="integration-hy2",
+        public_host="bootstrap.invalid",
+        public_port=28443,
+        listen_port=8443,
+        sni="bootstrap.invalid",
+        client=None,
+    )
+    ctx = {}
+
+    def api(method, path, data=None):
+        if method == "GET" and path.startswith("/api/admin/agents/"):
+            ctx["agent"].poll_node(ctx["spec"])
+        res = admin.request(method, path, json=data)
+        res.raise_for_status()
+        return res.json()
+
+    def ssh(_, action, **cfg):
+        if action == "verify-owned":
+            assert ctx["agent"].authenticate(ctx["spec"]["node_id"], cfg["password"])[
+                "ok"
+            ]
+            return
+        assert action == "install"
+        proxy = tmp_path / "config.yaml"
+        proxy.write_text("auth: {}\n")
+        entry = dict(
+            node_id=cfg["node_id"],
+            token=cfg["token"],
+            protocol="hysteria2",
+            hysteria_config=str(proxy),
+            backup_dir=str(tmp_path / "backups"),
+            auth_port=19281,
+            stats_port=19282,
+        )
+        agent = mod.Agent(
+            dict(
+                endpoint="https://testserver",
+                state_path=str(tmp_path / "state.json"),
+                nodes=[entry],
+            )
+        )
+
+        def transport(method, path, token, payload=None):
+            res = peer.request(
+                method, path, headers={"X-Sub-App-Agent-Token": token}, json=payload
+            )
+            res.raise_for_status()
+            return res.json()
+
+        monkeypatch.setattr(agent, "request_json", transport)
+        monkeypatch.setattr(agent, "_service_restart", lambda spec: True)
+        monkeypatch.setattr(
+            agent, "capabilities", lambda spec: {"managed_auth_modes": True}
+        )
+        monkeypatch.setattr(agent, "collect_traffic", lambda spec: [])
+        ctx.update(agent=agent, spec=entry)
+
+    monkeypatch.setattr(boot, "remote", ssh)
+    boot.provision(a, api)
+    node = next(r for r in api("GET", "/api/admin/nodes") if r["name"] == a.name)
+    assert (
+        node["enabled"],
+        node["port"],
+        node["allocated_to"],
+        node["agent"]["status"],
+    ) == (True, 28443, 0, "ready")
+    assert not node["per_user_enabled"]
+
+
 def _seed_subscription() -> None:
     db = Session()
     try:
