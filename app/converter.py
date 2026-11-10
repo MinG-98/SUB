@@ -25,15 +25,30 @@ def parse_uri(uri):
     if scheme == "vmess":
         return _parse_vmess(uri)
 
-    p = urlparse(uri)
+    try:
+        p = urlparse(uri)
+        host = p.hostname or ""
+        port = p.port or 0
+    except ValueError:
+        # urllib.parse intentionally defers malformed host/port errors until
+        # hostname/port access. Treat malformed pasted rows as invalid input.
+        return None
+    if (
+        not host.strip()
+        or any(character.isspace() or ord(character) < 33 for character in host)
+        or not 1 <= port <= 65535
+    ):
+        return None
+    if scheme == "vless" and not (p.username or "").strip():
+        return None
     q = {k: v[0] for k, v in parse_qs(p.query).items()}
     name = unquote(p.fragment) if p.fragment else ""
 
     node = {
         "scheme": "hysteria2" if scheme == "hy2" else scheme,
         "name": name,
-        "host": p.hostname or "",
-        "port": p.port or 0,
+        "host": host,
+        "port": port,
         "user": unquote(p.username) if p.username else "",
         "password": unquote(p.password) if p.password else "",
         "params": q,
@@ -48,12 +63,26 @@ def _parse_vmess(uri):
         cfg = json.loads(base64.b64decode(_b64pad(raw)).decode("utf-8"))
     except Exception:
         return None
+    if not isinstance(cfg, dict):
+        return None
+    host = cfg.get("add")
+    user = cfg.get("id")
+    if not isinstance(host, str) or not host.strip():
+        return None
+    if not isinstance(user, str) or not user.strip():
+        return None
+    try:
+        port = int(cfg.get("port", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
     return {
         "scheme": "vmess",
         "name": cfg.get("ps", ""),
-        "host": cfg.get("add", ""),
-        "port": int(cfg.get("port", 0) or 0),
-        "user": cfg.get("id", ""),
+        "host": host,
+        "port": port,
+        "user": user,
         "password": "",
         "params": cfg,
         "uri": uri,
@@ -183,14 +212,17 @@ def render(uris, target):
     """Render a list of raw URIs into the requested subscription format."""
     target = (target or "v2ray").lower()
 
-    if target in ("v2ray", "base64", "raw"):
+    # Shadowrocket imports the standard Base64 subscription form: one raw
+    # node URI per line, wrapped in ordinary (non-URL-safe) Base64.
+    if target in ("v2ray", "base64", "shadowrocket"):
         body = "\n".join(uris)
-        if target == "raw":
-            return body, "text/plain; charset=utf-8"
         return (
             base64.b64encode(body.encode("utf-8")).decode(),
             "text/plain; charset=utf-8",
         )
+
+    if target == "raw":
+        return "\n".join(uris), "text/plain; charset=utf-8"
 
     if target in ("clash", "clashmeta", "mihomo"):
         proxies = []

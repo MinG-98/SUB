@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.account_policy import is_expired  # noqa: E402
 from app.credentials import ensure_credential  # noqa: E402
 from app.models import (  # noqa: E402
     Allocation,
@@ -31,11 +32,12 @@ from app.models import (  # noqa: E402
     utcnow,
 )
 from app.proxy_adapters import (  # noqa: E402
-    SUPPORTED_NODES,
     activate_credential,
+    adapter_info,
     node_per_user_enabled,
     sync_vless_config,
 )
+from app.quota import flow_limit_reached  # noqa: E402
 
 STATUS_PATH = Path(
     os.environ.get(
@@ -48,7 +50,6 @@ def reconcile(db):
     activated = 0
     errors = 0
     revoked = 0
-    vless_changed = False
     friends = db.scalars(select(Friend).order_by(Friend.id)).all()
     for friend in friends:
         allocations = db.scalars(
@@ -58,25 +59,36 @@ def reconcile(db):
         rows = db.scalars(
             select(UserNodeCredential).where(UserNodeCredential.friend_id == friend.id)
         ).all()
-        if not friend.enabled or not friend.per_user_credentials:
+        if (
+            not friend.enabled
+            or not friend.per_user_credentials
+            or is_expired(friend.expires_at)
+            or flow_limit_reached(db, friend)
+        ):
             for row in rows:
-                if row.revoked_at is None:
-                    row.status = "revoked"
-                    row.revoked_at = utcnow()
-                    row.grace_until = None
-                    revoked += 1
-                    vless_changed = vless_changed or row.node_id == 11
+                if row.revoked_at is not None:
+                    continue
+                row.status = "revoked"
+                row.revoked_at = utcnow()
+                row.grace_until = None
+                revoked += 1
             continue
 
         for node_id in wanted:
-            info = SUPPORTED_NODES.get(node_id)
             node = db.get(Node, node_id)
             if (
-                not info
-                or not node
+                not node
+                or not node.enabled
+                or is_expired(node.expires_at)
+                or not adapter_info(node)
                 or not node_per_user_enabled(node)
-                or node.protocol != info["protocol"]
             ):
+                for row in rows:
+                    if row.node_id == node_id and row.revoked_at is None:
+                        row.status = "revoked"
+                        row.revoked_at = utcnow()
+                        row.grace_until = None
+                        revoked += 1
                 continue
             row = ensure_credential(db, friend, node)
             if row.status not in {"active", "grace"}:
@@ -85,23 +97,30 @@ def reconcile(db):
                     activated += 1
                 else:
                     errors += 1
-                vless_changed = vless_changed or node_id == 11
 
         for row in rows:
-            if row.node_id not in wanted and row.revoked_at is None:
+            allocated_node = db.get(Node, row.node_id)
+            if (
+                row.node_id not in wanted
+                or not allocated_node
+                or not allocated_node.enabled
+                or is_expired(allocated_node.expires_at)
+                or not node_per_user_enabled(allocated_node)
+            ) and row.revoked_at is None:
                 row.status = "revoked"
                 row.revoked_at = utcnow()
                 row.grace_until = None
                 revoked += 1
-                vless_changed = vless_changed or row.node_id == 11
-
-    if vless_changed:
+    local_vless = db.scalar(
+        select(Node).where(Node.adapter_kind == "local_vless", Node.protocol == "vless")
+    )
+    if local_vless:
         try:
-            sync_vless_config(db)
+            # The adapter's applied-generation marker makes this idempotent
+            # and lets every timer pass retry a failed apply.
+            sync_vless_config(db, node=local_vless)
         except Exception:
-            # Individual rows already carry their adapter error; keep the
-            # transaction usable and let the next timer retry.
-            pass
+            errors += 1
     db.commit()
     return {"activated": activated, "errors": errors, "revoked": revoked}
 

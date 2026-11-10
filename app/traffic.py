@@ -12,16 +12,19 @@ from sqlalchemy import delete, select
 
 from app.models import (
     CollectorRun,
+    FetchLog,
     FlowRecord,
     Node,
     NodeMetricSample,
 )
+from app.node_policy import is_real_node
 
 log = logging.getLogger(__name__)
 
 NEZHA_ENV_FILE = Path(os.environ.get("NEZHA_ENV_FILE", "/etc/sub-app/nezha.env"))
 DEFAULT_NEZHA_BASE_URL = "http://127.0.0.1:18008"
 RETENTION_DAYS = 30
+FETCH_LOG_RETENTION_DAYS = int(os.environ.get("SUB_APP_FETCH_LOG_RETENTION_DAYS", "90"))
 POLL_SECONDS = 300
 
 
@@ -157,7 +160,9 @@ def fetch_servers(base_url: str, token: str) -> list[dict]:
 def _naive_utc(value):
     if value is None:
         return None
-    return value.replace(tzinfo=None) if value.tzinfo else value
+    if value.tzinfo:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _bucket(now):
@@ -184,19 +189,36 @@ def _non_negative_delta(current, previous):
     return current - previous
 
 
-def run_collector(db, now=None, retention_days=RETENTION_DAYS):
-    now = now or datetime.now(timezone.utc)
-    collected_at = _naive_utc(now)
-    bucket = _bucket(now)
-    started = CollectorRun(started_at=collected_at, source="nezha", status="running")
+def run_collector(
+    db,
+    now=None,
+    retention_days=RETENTION_DAYS,
+    fetch_log_retention_days=FETCH_LOG_RETENTION_DAYS,
+):
+    started_at = _naive_utc(now or datetime.now(timezone.utc))
+    bucket = _bucket(started_at)
+    started = CollectorRun(started_at=started_at, source="nezha", status="running")
     db.add(started)
     db.commit()
     base_url, token = collector_config()
 
     try:
+        if fetch_log_retention_days > 0:
+            fetch_log_cutoff = started_at - timedelta(days=fetch_log_retention_days)
+            db.execute(delete(FetchLog).where(FetchLog.created_at < fetch_log_cutoff))
+            # Retention is independent from Nezha availability. Commit before
+            # the remote fetch so its failure cannot roll pruning back.
+            db.commit()
         servers = fetch_servers(base_url, token)
         by_id = {item["id"]: item for item in servers if item["id"]}
-        nodes = db.scalars(select(Node).where(Node.nezha_server_id.is_not(None))).all()
+        nodes = [
+            node
+            for node in db.scalars(
+                select(Node).where(Node.nezha_server_id.is_not(None))
+            ).all()
+            if is_real_node(node)
+        ]
+        collected_at = _naive_utc(datetime.now(timezone.utc))
         started.nodes_total = len(nodes)
         written = 0
         missing = []
@@ -254,7 +276,7 @@ def run_collector(db, now=None, retention_days=RETENTION_DAYS):
             flow.bytes_out = delta_out
             written += 1
 
-        cutoff = _naive_utc(now) - timedelta(days=retention_days)
+        cutoff = started_at - timedelta(days=retention_days)
         db.execute(delete(NodeMetricSample).where(NodeMetricSample.bucket < cutoff))
         db.execute(
             delete(FlowRecord).where(

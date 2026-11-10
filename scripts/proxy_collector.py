@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
@@ -20,16 +22,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from app.account_policy import is_expired  # noqa: E402
 from app.credentials import credential_stats_id  # noqa: E402
 from app.models import (  # noqa: E402
     CollectorRun,
     FlowRecord,
     Friend,
+    Node,
     ProxyTrafficCounter,
     UserNodeCredential,
     make_session_factory,
+    utc_iso,
     utcnow,
 )
+from app.quota import credential_kick_stats_ids  # noqa: E402
 
 STATUS_PATH = Path(
     os.environ.get(
@@ -54,15 +60,45 @@ def _non_negative(current, previous):
     return current - previous
 
 
+def _loopback_http_base(listen: str) -> str:
+    try:
+        parsed = urlsplit(f"//{listen}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("Hysteria traffic API 地址无效") from exc
+    if (
+        not host
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or "%" in host
+    ):
+        raise RuntimeError("Hysteria traffic API 地址无效")
+    if host.lower() == "localhost":
+        normalized_host = "127.0.0.1"
+    else:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise RuntimeError("Hysteria traffic API 必须绑定 loopback") from exc
+        if not address.is_loopback:
+            raise RuntimeError("Hysteria traffic API 必须绑定 loopback")
+        normalized_host = (
+            f"[{address.compressed}]" if address.version == 6 else address.compressed
+        )
+    return f"http://{normalized_host}:{port}"
+
+
 def _hysteria_endpoint():
     cfg = yaml.safe_load(Path("/etc/hysteria-us-8443/config.yaml").read_text()) or {}
     stats = cfg.get("trafficStats") or {}
     listen = str(stats.get("listen", "127.0.0.1:9999"))
-    if ":" not in listen:
-        raise RuntimeError("Hysteria traffic API 地址无效")
-    host, port = listen.rsplit(":", 1)
-    host = host or "127.0.0.1"
-    return f"http://{host}:{int(port)}", str(stats.get("secret", ""))
+    return _loopback_http_base(listen), str(stats.get("secret", ""))
 
 
 def _hysteria_stats():
@@ -81,13 +117,80 @@ def _hysteria_stats():
     return data
 
 
+def _hysteria_online():
+    base, secret = _hysteria_endpoint()
+    if not secret:
+        raise RuntimeError("Hysteria traffic API 未配置 secret")
+    response = httpx.get(
+        f"{base}/online",
+        headers={"Authorization": secret},
+        timeout=12,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Hysteria online API 返回格式错误")
+    return {
+        str(client_id)
+        for client_id, count in data.items()
+        if type(count) is int and count > 0
+    }
+
+
+def _hysteria_kick(stats_ids: list[str]) -> None:
+    if not stats_ids:
+        return
+    base, secret = _hysteria_endpoint()
+    if not secret:
+        raise RuntimeError("Hysteria traffic API 未配置 secret")
+    response = httpx.post(
+        f"{base}/kick",
+        headers={"Authorization": secret},
+        json=stats_ids,
+        timeout=12,
+    )
+    response.raise_for_status()
+
+
+def kick_overquota_hysteria_sessions(db) -> dict[str, int]:
+    """Kick online local-HY2 sessions whose credentials are no longer valid."""
+    node_id = db.scalar(
+        select(Node.id).where(
+            Node.adapter_kind == "local_hy2", Node.protocol == "hysteria2"
+        )
+    )
+    if node_id is None:
+        raise RuntimeError("未配置本机 Hysteria2 适配器节点")
+    candidates = credential_kick_stats_ids(db, node_id, "hysteria2")
+    if not candidates:
+        return {"candidates": 0, "online": 0, "kicked": 0}
+    targets = sorted(set(candidates).intersection(_hysteria_online()))
+    if targets:
+        _hysteria_kick(targets)
+    return {
+        "candidates": len(candidates),
+        "online": len(targets),
+        "kicked": len(targets),
+    }
+
+
 def collect_hysteria(db, now):
+    node_id = db.scalar(
+        select(Node.id).where(
+            Node.adapter_kind == "local_hy2", Node.protocol == "hysteria2"
+        )
+    )
+    if node_id is None:
+        raise RuntimeError("未配置本机 Hysteria2 适配器节点")
+    node = db.get(Node, node_id)
+    if not node or is_expired(node.expires_at):
+        return {"status": "success", "stats_clients": 0, "samples_written": 0}
     stats = _hysteria_stats()
     rows = db.execute(
         select(UserNodeCredential, Friend)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
-            UserNodeCredential.node_id == 4,
+            UserNodeCredential.node_id == node_id,
             UserNodeCredential.protocol == "hysteria2",
             UserNodeCredential.revoked_at.is_(None),
             Friend.enabled.is_(True),
@@ -97,6 +200,8 @@ def collect_hysteria(db, now):
     by_id = {}
     current_time = utcnow().replace(tzinfo=None)
     for row, _friend in rows:
+        if is_expired(_friend.expires_at):
+            continue
         if row.status == "grace" and (
             not row.grace_until or row.grace_until <= current_time
         ):
@@ -115,7 +220,7 @@ def collect_hysteria(db, now):
         counter = db.scalar(
             select(ProxyTrafficCounter).where(
                 ProxyTrafficCounter.source == "hysteria2",
-                ProxyTrafficCounter.node_id == 4,
+                ProxyTrafficCounter.node_id == node_id,
                 ProxyTrafficCounter.credential_key == str(client_id),
             )
         )
@@ -126,7 +231,7 @@ def collect_hysteria(db, now):
         if counter is None:
             counter = ProxyTrafficCounter(
                 source="hysteria2",
-                node_id=4,
+                node_id=node_id,
                 friend_id=row.friend_id,
                 credential_key=str(client_id),
             )
@@ -135,7 +240,7 @@ def collect_hysteria(db, now):
         counter.last_bytes_in = current_in
         counter.last_bytes_out = current_out
         counter.updated_at = now.replace(tzinfo=None)
-        key = f"hysteria2:4:{client_id}:{bucket.isoformat()}"
+        key = f"hysteria2:{node_id}:{client_id}:{bucket.isoformat()}"
         flow = db.scalar(
             select(FlowRecord).where(
                 FlowRecord.source == "hysteria2",
@@ -144,7 +249,7 @@ def collect_hysteria(db, now):
         )
         if flow is None:
             flow = FlowRecord(
-                node_id=4,
+                node_id=node_id,
                 friend_id=row.friend_id,
                 bucket=bucket,
                 source="hysteria2",
@@ -188,12 +293,22 @@ def _vless_stats():
 def collect_vless(db, now):
     """Collect named VLESS user counters from the loopback V2Ray API."""
 
+    node_id = db.scalar(
+        select(Node.id).where(
+            Node.adapter_kind == "local_vless", Node.protocol == "vless"
+        )
+    )
+    if node_id is None:
+        raise RuntimeError("未配置本机 VLESS 适配器节点")
+    node = db.get(Node, node_id)
+    if not node or is_expired(node.expires_at):
+        return {"status": "success", "stats_users": 0, "samples_written": 0}
     stats = _vless_stats()
     rows = db.execute(
         select(UserNodeCredential, Friend)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
-            UserNodeCredential.node_id == 11,
+            UserNodeCredential.node_id == node_id,
             UserNodeCredential.protocol == "vless",
             UserNodeCredential.revoked_at.is_(None),
             Friend.enabled.is_(True),
@@ -203,6 +318,8 @@ def collect_vless(db, now):
     by_id = {}
     current_time = utcnow().replace(tzinfo=None)
     for row, _friend in rows:
+        if is_expired(_friend.expires_at):
+            continue
         if row.status == "grace" and (
             not row.grace_until or row.grace_until <= current_time
         ):
@@ -237,7 +354,7 @@ def collect_vless(db, now):
         counter = db.scalar(
             select(ProxyTrafficCounter).where(
                 ProxyTrafficCounter.source == "vless",
-                ProxyTrafficCounter.node_id == 11,
+                ProxyTrafficCounter.node_id == node_id,
                 ProxyTrafficCounter.credential_key == stats_id,
             )
         )
@@ -248,7 +365,7 @@ def collect_vless(db, now):
         if counter is None:
             counter = ProxyTrafficCounter(
                 source="vless",
-                node_id=11,
+                node_id=node_id,
                 friend_id=row.friend_id,
                 credential_key=stats_id,
             )
@@ -257,7 +374,7 @@ def collect_vless(db, now):
         counter.last_bytes_in = current_in
         counter.last_bytes_out = current_out
         counter.updated_at = now.replace(tzinfo=None)
-        key = f"vless:11:{stats_id}:{bucket.isoformat()}"
+        key = f"vless:{node_id}:{stats_id}:{bucket.isoformat()}"
         flow = db.scalar(
             select(FlowRecord).where(
                 FlowRecord.source == "vless",
@@ -266,7 +383,7 @@ def collect_vless(db, now):
         )
         if flow is None:
             flow = FlowRecord(
-                node_id=11,
+                node_id=node_id,
                 friend_id=row.friend_id,
                 bucket=bucket,
                 source="vless",
@@ -307,9 +424,11 @@ def main():
     db_path = os.environ.get("SUB_APP_DB", os.path.join(ROOT, "data.db"))
     factory = make_session_factory(db_path)
     db = factory()
-    now = datetime.now(timezone.utc)
+    started_at = datetime.now(timezone.utc)
     run = CollectorRun(
-        started_at=now.replace(tzinfo=None), source="proxy", status="running"
+        started_at=started_at.astimezone(timezone.utc).replace(tzinfo=None),
+        source="proxy",
+        status="running",
     )
     db.add(run)
     db.commit()
@@ -320,8 +439,18 @@ def main():
             ("vless", collect_vless),
         ):
             try:
-                results[name] = callback(db, now)
+                results[name] = callback(db, started_at)
                 db.commit()
+                if name == "hysteria2":
+                    try:
+                        results[name]["quota_kick"] = kick_overquota_hysteria_sessions(
+                            db
+                        )
+                    except Exception as exc:
+                        # Traffic samples are already committed. Preserve them
+                        # while making an unsuccessful session kick visible.
+                        results[name]["status"] = "partial"
+                        results[name]["quota_kick_error"] = type(exc).__name__
             except Exception as exc:
                 db.rollback()
                 results[name] = {
@@ -333,7 +462,10 @@ def main():
             delete(FlowRecord).where(
                 FlowRecord.source.in_(["hysteria2", "vless"]),
                 FlowRecord.bucket
-                < (now.replace(tzinfo=None) - timedelta(days=RETENTION_DAYS)),
+                < (
+                    started_at.astimezone(timezone.utc).replace(tzinfo=None)
+                    - timedelta(days=RETENTION_DAYS)
+                ),
             )
         )
         statuses = [item.get("status") for item in results.values()]
@@ -347,14 +479,17 @@ def main():
             int(item.get("samples_written", 0)) for item in results.values()
         )
         run.nodes_total = 2
-        run.finished_at = now.replace(tzinfo=None)
+        finished_at = datetime.now(timezone.utc)
+        run.finished_at = finished_at.astimezone(timezone.utc).replace(tzinfo=None)
         run.error = "; ".join(
-            f"{name}:{item.get('error')}"
+            f"{name}:{item.get('error') or item.get('quota_kick_error')}"
             for name, item in results.items()
-            if item.get("error")
+            if item.get("error") or item.get("quota_kick_error")
         )[:1000]
         db.commit()
-        _write_status({"at": now.isoformat(), "status": run.status, "results": results})
+        _write_status(
+            {"at": utc_iso(finished_at), "status": run.status, "results": results}
+        )
         print(
             json.dumps(
                 {"ok": True, "status": run.status, "results": results},

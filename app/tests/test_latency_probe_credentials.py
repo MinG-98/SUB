@@ -113,9 +113,9 @@ def test_missing_secret_degrades_this_node_not_the_whole_run(latency_env, monkey
     latency.run_probes()
     status = latency.read_status()
     assert status["status"] != "error", "a missing secret must not blank the dashboard"
-    assert (
-        len(status["nodes"]) == 1
-    ), "the node must still be measured, via the base URI"
+    assert len(status["nodes"]) == 1, (
+        "the node must still be measured, via the base URI"
+    )
     assert status["nodes"][0]["credential_source"] == "base"
 
 

@@ -3,6 +3,8 @@ import { reactive } from "vue";
 export const auth = reactive({
   checked: false,
   authenticated: false,
+  username: "",
+  role: "",
 });
 
 let toastId = 0;

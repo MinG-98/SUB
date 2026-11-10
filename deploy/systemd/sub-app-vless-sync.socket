@@ -1,0 +1,14 @@
+[Unit]
+Description=Restricted VLESS configuration sync socket for Sub App
+
+[Socket]
+ListenStream=/run/sub-app-vless-sync.sock
+SocketUser=root
+SocketGroup=sub-app
+SocketMode=0660
+Accept=yes
+Service=sub-app-vless-sync@.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Create a verified Sub App SQLite backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=sub-app
+Group=sub-app
+EnvironmentFile=/etc/sub-app/app.env
+WorkingDirectory=/opt/sub-app
+Environment=SUB_APP_BACKUP_DIR=/var/lib/sub-app-backup
+Environment=SUB_APP_BACKUP_RETENTION_DAYS=30
+ExecStart=/opt/sub-app/.venv/bin/python /opt/sub-app/scripts/backup_db.py
+UMask=0077
+StateDirectory=sub-app-backup
+StateDirectoryMode=0700
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes

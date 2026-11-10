@@ -37,6 +37,7 @@ from sqlalchemy import select
 from app.converter import parse_uri
 from app.credentials import per_user_feature_enabled, render_credential_uri
 from app.models import Friend, Node, UserNodeCredential, make_session_factory
+from app.node_policy import is_real_node
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = os.environ.get("SUB_APP_DB", str(ROOT / "data.db"))
@@ -46,6 +47,8 @@ STATUS_PATH = Path(
 LOCK_PATH = Path(
     os.environ.get("SUB_APP_LATENCY_LOCK", "/var/lib/sub-app/latency-probe.lock")
 )
+PROBE_LOCK_START_GRACE_SECONDS = 30
+PROBE_LOCK_MAX_AGE_SECONDS = 60 * 60
 TMP_ROOT = Path(os.environ.get("SUB_APP_LATENCY_TMP", "/var/lib/sub-app/latency-tmp"))
 TARGET_URL = os.environ.get(
     "SUB_APP_LATENCY_TARGET", "https://www.gstatic.com/generate_204"
@@ -94,17 +97,67 @@ def read_status() -> dict:
             "started_at": None,
             "finished_at": None,
             "control": {"state": "pending", "value": "未测试"},
-            "summary": {"nodes_total": 0, "entry_ok": 0, "proxy_ok": 0},
+            "summary": {
+                "nodes_total": 0,
+                "entry_total": 0,
+                "entry_ok": 0,
+                "proxy_total": 0,
+                "proxy_ok": 0,
+            },
             "nodes": [],
             "target": {"url": TARGET_URL},
         }
+
+
+def _probe_lock_is_live(now: float | None = None) -> bool:
+    """Treat a lock as active only while its recorded process is plausibly alive."""
+
+    now = time.time() if now is None else now
+    try:
+        stat = LOCK_PATH.stat()
+        raw = LOCK_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+    try:
+        payload = json.loads(raw)
+        pid = int(payload.get("pid", 0))
+        started_at = float(payload.get("started_at_epoch", 0))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        age = now - stat.st_mtime
+        return 0 <= age < PROBE_LOCK_START_GRACE_SECONDS
+
+    age = now - started_at
+    if pid <= 0:
+        return 0 <= now - stat.st_mtime < PROBE_LOCK_START_GRACE_SECONDS
+    if age < 0 or age > PROBE_LOCK_MAX_AGE_SECONDS:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # An indeterminate OS error must not delete a plausibly live lock.
+        return True
+    return True
 
 
 def start_probe() -> dict:
     """Start one detached probe run; the API remains responsive."""
 
     if LOCK_PATH.exists():
-        return {"ok": True, "started": False, "status": "running"}
+        if _probe_lock_is_live():
+            return {"ok": True, "started": False, "status": "running"}
+        try:
+            LOCK_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return {"ok": False, "started": False, "status": "error"}
     script = ROOT / "scripts" / "latency_probe.py"
     try:
         subprocess.Popen(
@@ -139,7 +192,9 @@ def _result(
         else (
             "未就绪"
             if state == "unsupported"
-            else "探测中" if state == "pending" else "不可达"
+            else "探测中"
+            if state == "pending"
+            else "不可达"
         )
     )
     if state == "ok" and ms is not None:
@@ -155,11 +210,7 @@ def _result(
 
 
 def _remark_node(node: Node, parsed: dict | None) -> bool:
-    if str(node.name or "").startswith("⚠️"):
-        return True
-    if not parsed:
-        return False
-    return parsed.get("host") == "127.0.0.1" or int(parsed.get("port") or 0) <= 3
+    return not is_real_node(node)
 
 
 def _endpoint(host: str, port: int) -> str:
@@ -279,6 +330,27 @@ def _wait_for_local_listener(process, port: int, timeout: float = 3.0) -> bool:
         except OSError:
             time.sleep(0.05)
     return False
+
+
+def _stop_hysteria_process(process, reader) -> None:
+    """Stop the probe client, let its stdout reader reach EOF, then close it.
+
+    Closing ``process.stdout`` before joining the reader races its iterator and
+    can raise ``ValueError: I/O operation on closed file`` in the daemon thread.
+    The child is reaped first so the pipe reaches EOF and the reader can finish.
+    """
+
+    if process is not None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+    if reader is not None:
+        reader.join()
+    if process is not None and process.stdout is not None:
+        process.stdout.close()
 
 
 def _hysteria_failure_reason(output: str, *, connected: bool) -> str:
@@ -497,17 +569,7 @@ def _hysteria_probe_results(parsed: dict) -> tuple[dict, dict]:
             _result("bad", reason=reason, source="hysteria-socks5"),
         )
     finally:
-        if process is not None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
-            if process.stdout is not None:
-                process.stdout.close()
-        if reader is not None:
-            reader.join(timeout=1)
+        _stop_hysteria_process(process, reader)
         if path is not None:
             path.unlink(missing_ok=True)
 
@@ -690,8 +752,14 @@ def _probe_node(node: dict) -> dict:
 
 
 def _summary(nodes: list[dict]) -> dict:
+    def checked(kind: str) -> list[dict]:
+        return [row for row in nodes if row.get(kind, {}).get("state") in {"ok", "bad"}]
+
     def count(kind: str) -> int:
         return sum(row.get(kind, {}).get("state") == "ok" for row in nodes)
+
+    entry_checked = checked("entry")
+    proxy_checked = checked("proxy")
 
     def average(kind: str) -> int | None:
         values = [
@@ -703,7 +771,9 @@ def _summary(nodes: list[dict]) -> dict:
 
     return {
         "nodes_total": len(nodes),
+        "entry_total": len(entry_checked),
         "entry_ok": count("entry"),
+        "proxy_total": len(proxy_checked),
         "proxy_ok": count("proxy"),
         "entry_avg_ms": average("entry"),
         "proxy_avg_ms": average("proxy"),
@@ -714,9 +784,27 @@ def run_probes() -> None:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
     except FileExistsError:
         return
+    try:
+        lock_stat = os.fstat(fd)
+        lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+        os.write(
+            fd,
+            json.dumps(
+                {"pid": os.getpid(), "started_at_epoch": time.time()},
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        os.fsync(fd)
+    except OSError:
+        try:
+            LOCK_PATH.unlink()
+        except OSError:
+            pass
+        return
+    finally:
+        os.close(fd)
     started = _now()
     try:
         _write_json(
@@ -725,7 +813,13 @@ def run_probes() -> None:
                 "started_at": started,
                 "finished_at": None,
                 "control": {"state": "pending", "value": "探测中"},
-                "summary": {"nodes_total": 0, "entry_ok": 0, "proxy_ok": 0},
+                "summary": {
+                    "nodes_total": 0,
+                    "entry_total": 0,
+                    "entry_ok": 0,
+                    "proxy_total": 0,
+                    "proxy_ok": 0,
+                },
                 "nodes": [],
                 "target": {"url": TARGET_URL},
             }
@@ -843,6 +937,10 @@ def run_probes() -> None:
         )
     finally:
         try:
-            LOCK_PATH.unlink()
+            current = LOCK_PATH.stat()
+            if (current.st_dev, current.st_ino) == lock_identity:
+                LOCK_PATH.unlink()
         except FileNotFoundError:
+            pass
+        except OSError:
             pass

@@ -10,6 +10,7 @@ const loading = ref(true);
 const error = ref("");
 const friends = ref([]);
 const nodes = ref([]);
+const announcements = ref([]);
 const search = ref("");
 const filter = ref("all");
 const sortKey = ref("uid");
@@ -25,16 +26,28 @@ const credentialsLoading = ref(false);
 const credentialBusy = ref({});
 
 function emptyForm() {
-  return { uid: "", remark: "", flow_limit_gb: 0, device_limit: 0, per_user_credentials: false, node_ids: [], rotate_token: false };
+  return { uid: "", remark: "", flow_limit_gb: 0, device_limit: 0, per_user_credentials: false, node_ids: [], announcement_ids: [], rotate_token: false, expires_at: "" };
+}
+
+function expiryDays(value) {
+  return value ? Math.ceil((new Date(value).getTime() - Date.now()) / 86400000) : null;
+}
+
+function expiryText(value) {
+  const days = expiryDays(value);
+  if (days === null) return "未设置到期日";
+  if (days < 0) return `已到期 ${Math.abs(days)} 天`;
+  return days === 0 ? "今天到期" : `${days} 天后到期`;
 }
 
 async function load() {
   loading.value = true;
   error.value = "";
   try {
-    const [friendRows, nodeRows] = await Promise.all([api.friends(), api.nodes()]);
+    const [friendRows, nodeRows, announcementRows] = await Promise.all([api.friends(), api.nodes(), api.announcements()]);
     friends.value = friendRows || [];
     nodes.value = nodeRows || [];
+    announcements.value = announcementRows || [];
   } catch (e) {
     error.value = e.message || "用户加载失败";
   } finally {
@@ -50,7 +63,7 @@ const filtered = computed(() => {
     const queryMatch = !q || [friend.uid, friend.remark].some((value) => String(value || "").toLowerCase().includes(q));
     const filterMatch = filter.value === "all"
       || (filter.value === "enabled" && friend.enabled)
-      || (filter.value === "attention" && (!friend.enabled || friend.flow_alert === "over" || friend.credential_status?.some((row) => ["error", "pending"].includes(row.status))));
+      || (filter.value === "attention" && (!friend.enabled || friend.flow_alert === "over" || (expiryDays(friend.expires_at) !== null && expiryDays(friend.expires_at) <= 7) || friend.credential_status?.some((row) => ["error", "pending"].includes(row.status))));
     return queryMatch && filterMatch;
   });
 });
@@ -85,7 +98,7 @@ const sortedFriends = computed(() => {
 });
 
 function realNodeCount(friend) {
-  return friend.node_ids.filter((id) => isRealNode(nodeById.value.get(id) || { server: "127.0.0.1" })).length;
+  return friend.node_ids.length;
 }
 
 function authState(friend) {
@@ -151,7 +164,9 @@ async function openEdit(friend) {
     device_limit: friend.device_limit,
     per_user_credentials: friend.per_user_credentials,
     node_ids: [...friend.node_ids],
+    announcement_ids: [...(friend.announcement_ids || [])],
     rotate_token: false,
+    expires_at: friend.expires_at ? friend.expires_at.slice(0, 10) : "",
   };
   formError.value = "";
   credentials.value = friend.credential_status || [];
@@ -177,6 +192,8 @@ async function submit() {
       device_limit: Number(form.value.device_limit) || 0,
       per_user_credentials: form.value.per_user_credentials,
       node_ids: form.value.node_ids,
+      announcement_ids: form.value.announcement_ids,
+      expires_at: form.value.expires_at || null,
     };
     if (editing.value) {
       if (form.value.rotate_token) payload.rotate_token = true;
@@ -208,7 +225,7 @@ async function toggleEnabled(friend) {
 }
 
 async function removeFriend(friend) {
-  if (!window.confirm(`确定删除用户「${friend.uid}」？此操作不可撤销。`)) return;
+  if (!window.confirm(`确定删除用户「${friend.uid}」？将级联删除 ${friend.device_count || 0} 台设备、${friend.node_ids?.length || 0} 个节点分配、${friend.announcement_ids?.length || 0} 个公告分配及用户凭据/流量记录；订阅 Token 立即失效，且此操作不可撤销。`)) return;
   try {
     await api.deleteFriend(friend.id);
     pushToast("用户已删除", "success");
@@ -241,7 +258,7 @@ onMounted(load);
 
 <template>
   <header class="view-hd">
-    <div class="view-copy"><span class="lbl lbl-am">Subscribers</span><h2>用户管理</h2><p>用户、配额、节点分配与订阅入口集中管理。</p></div>
+    <div class="view-copy"><span class="lbl lbl-am">用户订阅</span><h2>用户管理</h2><p>用户、配额、节点分配与订阅入口集中管理。</p></div>
     <div class="view-actions">
       <label class="search"><span aria-hidden="true">/</span><span class="visually-hidden">搜索用户</span><input v-model="search" placeholder="搜索 UID 或备注"></label>
       <button class="b b-am" @click="openCreate">新建用户</button>
@@ -267,7 +284,7 @@ onMounted(load);
       <button class="table-head-cell" type="button" :aria-sort="sortKey === 'nodes' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('nodes')">节点 / 设备 <span>{{ sortArrow('nodes') }}</span></button>
       <button class="table-head-cell" type="button" :aria-sort="sortKey === 'flow' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('flow')">用户级流量 <span>{{ sortArrow('flow') }}</span></button>
       <button class="table-head-cell" type="button" :aria-sort="sortKey === 'cred' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('cred')">凭据 <span>{{ sortArrow('cred') }}</span></button>
-      <span class="table-head-label">操作</span>
+      <span class="table-head-label">订阅格式 / 操作</span>
     </div>
     <article v-for="friend in sortedFriends" :key="friend.id" class="entity table-row" :class="{ 'is-muted': !friend.enabled }">
       <div class="table-cell table-main">
@@ -276,8 +293,8 @@ onMounted(load);
       </div>
       <div class="table-cell"><strong>{{ realNodeCount(friend) }} 个节点</strong><span>{{ friend.device_count || 0 }}{{ friend.device_limit ? ` / ${friend.device_limit}` : "" }} 台设备</span></div>
       <div class="table-cell table-flow"><strong>{{ formatBytes(friend.flow_used_bytes || 0) }} / {{ friend.flow_limit_bytes ? formatBytes(friend.flow_limit_bytes) : "不限" }}</strong><div v-if="friend.flow_limit_bytes" class="bar table-bar"><i :class="quotaTone(friend)" :style="{ '--meter': `${Math.min(100, Number(friend.flow_percent || 0))}%` }"></i></div></div>
-      <div class="table-cell"><strong class="table-state" :class="authState(friend).tone">{{ authState(friend).text }}</strong><span>{{ friend.flow_alert === "over" ? "配额已超" : `创建于 ${timeAgo(friend.created_at)}` }}</span></div>
-      <div class="table-actions"><button class="b" @click="copyText(friend.links?.clash, '订阅链接')">复制订阅</button><button class="b b-am" @click="openEdit(friend)">查看与编辑</button></div>
+      <div class="table-cell"><strong class="table-state" :class="authState(friend).tone">{{ authState(friend).text }}</strong><span>{{ friend.expires_at ? `到期：${friend.expires_at.slice(0, 10)} · ${expiryText(friend.expires_at)}` : `创建于 ${timeAgo(friend.created_at)}` }}</span><span v-if="friend.last_shared_fallback_nodes || friend.last_skipped_node_count || friend.last_expired_node_count" class="mk is-warn" role="status">最近订阅：{{ friend.last_shared_fallback_nodes || 0 }} 回退 · {{ friend.last_skipped_node_count || 0 }} 未同步 · {{ friend.last_expired_node_count || 0 }} 到期</span></div>
+      <div class="table-actions"><button class="b" :disabled="!friend.links?.clash" @click="copyText(friend.links?.clash, 'Clash 订阅链接')">复制 Clash</button><button class="b" :disabled="!friend.links?.shadowrocket" @click="copyText(friend.links?.shadowrocket, '小火箭订阅链接')">复制小火箭</button><button class="b" :disabled="!friend.links?.v2ray" @click="copyText(friend.links?.v2ray, 'V2Ray 订阅链接')">复制 V2Ray</button><button class="b b-am" @click="openEdit(friend)">查看与编辑</button></div>
     </article>
   </div>
 
@@ -285,7 +302,8 @@ onMounted(load);
     <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
     <div v-if="!editing" class="form-row"><label for="friend-uid">UID</label><input id="friend-uid" v-model="form.uid" placeholder="唯一标识，例如 alice"></div>
     <div class="form-row"><label for="friend-remark">备注</label><input id="friend-remark" v-model="form.remark" placeholder="可选"></div>
-    <div class="form-row"><label for="friend-flow">流量配额（GB，0 表示不限）</label><input id="friend-flow" v-model="form.flow_limit_gb" type="number" min="0"></div>
+    <div class="form-row"><label for="friend-expiry">订阅到期日（留空表示不限期）</label><input id="friend-expiry" v-model="form.expires_at" type="date"></div>
+    <div class="form-row"><label for="friend-flow">用户级可计量流量配额（GB，0 表示不限）</label><input id="friend-flow" v-model="form.flow_limit_gb" type="number" min="0"><small>达到后会阻止刷新订阅，并在下一次协调时撤销可计量的独立凭据。共享凭据节点无法按用户强制断流。</small></div>
     <div class="form-row"><label for="friend-device">设备上限（0 表示不限）</label><input id="friend-device" v-model="form.device_limit" type="number" min="0"></div>
     <div class="check"><input id="friend-peruser" v-model="form.per_user_credentials" type="checkbox"><label for="friend-peruser">启用用户级独立凭据；只向该用户下发同步成功的节点凭据</label></div>
 
@@ -294,6 +312,14 @@ onMounted(load);
       <div class="fold-body check-list">
         <div v-for="node in realNodes" :key="node.id" class="check"><input :id="`friend-node-${node.id}`" v-model="form.node_ids" type="checkbox" :value="node.id"><label :for="`friend-node-${node.id}`">{{ node.name }} <span class="n faint">· {{ node.protocol }}</span></label></div>
         <div v-if="!realNodes.length" class="st"><b>暂无可分配节点</b></div>
+      </div>
+    </details>
+
+    <details class="fold">
+      <summary>分配订阅公告 <span class="n">{{ form.announcement_ids.length }}/{{ announcements.length }}</span></summary>
+      <div class="fold-body check-list">
+        <div v-for="announcement in announcements" :key="announcement.id" class="check"><input :id="`friend-announcement-${announcement.id}`" v-model="form.announcement_ids" type="checkbox" :value="announcement.id"><label :for="`friend-announcement-${announcement.id}`">{{ announcement.name }} <span class="n faint">· {{ announcement.enabled ? "已发布" : "草稿" }}</span></label></div>
+        <div v-if="!announcements.length" class="st"><b>暂无公告</b></div>
       </div>
     </details>
 
@@ -316,7 +342,6 @@ onMounted(load);
       </div>
     </details>
 
-    <div v-if="editing" class="modal-foot between"><div class="modal-foot-group"><button class="b b-txt" @click="toggleEnabled(editing)">{{ editing.enabled ? "停用用户" : "启用用户" }}</button><button class="b b-txt b-bad" @click="removeFriend(editing)">删除用户</button></div><div class="modal-foot-group"><button class="b" @click="showForm = false">取消</button><button class="b b-am" :disabled="busy" @click="submit">{{ busy ? "保存中…" : "保存" }}</button></div></div>
-    <div v-else class="modal-foot"><button class="b" @click="showForm = false">取消</button><button class="b b-am" :disabled="busy" @click="submit">{{ busy ? "保存中…" : "保存" }}</button></div>
+    <div class="modal-foot"><button class="b" @click="showForm = false">取消</button><button class="b b-am" :disabled="busy" @click="submit">{{ busy ? "保存中…" : "保存" }}</button></div>
   </Modal>
 </template>

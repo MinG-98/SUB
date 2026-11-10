@@ -1,5 +1,6 @@
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import (
     Boolean,
@@ -20,6 +21,18 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
+def utc_iso(value):
+    """Serialize SQLite datetimes as explicit UTC timestamps."""
+
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
+
+
 def new_token(nbytes=16):
     return secrets.token_urlsafe(nbytes)
 
@@ -36,11 +49,15 @@ class Node(Base):
     protocol = Column(String(32), nullable=False)
     uri = Column(Text, nullable=False)
     server = Column(String(255), default="")
+    adapter_kind = Column(String(24), default="shared", nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
     sort_order = Column(Integer, default=0, nullable=False)
+    is_announcement = Column(Boolean, default=False, nullable=False)
     nezha_server_id = Column(Integer)
     per_user_enabled = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    expires_at = Column(DateTime)
 
     allocations = relationship(
         "Allocation", back_populates="node", cascade="all, delete-orphan"
@@ -70,6 +87,9 @@ class NodeAgent(Base):
         Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False
     )
     token_hash = Column(String(128), nullable=False)
+    pending_token_hash = Column(String(128))
+    pending_token_expires_at = Column(DateTime)
+    pending_token_last_seen = Column(DateTime)
     status = Column(String(16), default="pending", nullable=False)
     agent_version = Column(String(64), default="", nullable=False)
     capabilities = Column(Text, default="{}", nullable=False)
@@ -79,6 +99,52 @@ class NodeAgent(Base):
     last_error = Column(Text, default="", nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class AdminLoginThrottle(Base):
+    """Persistent per-peer failed-login state; client addresses are keyed, not stored."""
+
+    __tablename__ = "admin_login_throttles"
+
+    client_key = Column(String(64), primary_key=True)
+    failure_count = Column(Integer, default=0, nullable=False)
+    window_started_at = Column(DateTime, nullable=False)
+    blocked_until = Column(DateTime)
+    updated_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+
+class AdminSession(Base):
+    """Server-side revocation state for signed administrator session cookies."""
+
+    __tablename__ = "admin_sessions"
+
+    session_hash = Column(String(64), primary_key=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime)
+
+
+class AdminAuthState(Base):
+    """Persistent auth epoch so reverting a previous password cannot revive cookies."""
+
+    __tablename__ = "admin_auth_state"
+
+    id = Column(Integer, primary_key=True)
+    config_fingerprint = Column(String(64), nullable=False)
+    epoch = Column(String(64), nullable=False)
+
+
+class AdminAuditLog(Base):
+    """Append-only metadata for authenticated administrator mutations."""
+
+    __tablename__ = "admin_audit_logs"
+
+    id = Column(Integer, primary_key=True)
+    actor_fingerprint = Column(String(64), nullable=False)
+    method = Column(String(12), nullable=False)
+    path = Column(String(255), nullable=False)
+    status_code = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
 
 class Friend(Base):
@@ -93,9 +159,14 @@ class Friend(Base):
     device_limit = Column(Integer, default=0, nullable=False)
     per_user_credentials = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    expires_at = Column(DateTime)
 
     allocations = relationship(
         "Allocation", back_populates="friend", cascade="all, delete-orphan"
+    )
+    announcement_allocations = relationship(
+        "AnnouncementAllocation", back_populates="friend", cascade="all, delete-orphan"
     )
     devices = relationship(
         "Device", back_populates="friend", cascade="all, delete-orphan"
@@ -133,6 +204,44 @@ class Allocation(Base):
     node = relationship("Node", back_populates="allocations")
 
 
+class Announcement(Base):
+    __tablename__ = "announcements"
+
+    id = Column(Integer, primary_key=True)
+    legacy_node_id = Column(Integer, unique=True, index=True)
+    name = Column(String(160), nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    allocations = relationship(
+        "AnnouncementAllocation",
+        back_populates="announcement",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class AnnouncementAllocation(Base):
+    __tablename__ = "announcement_allocations"
+    __table_args__ = (
+        UniqueConstraint("friend_id", "announcement_id", name="uq_friend_announcement"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    friend_id = Column(
+        Integer, ForeignKey("friends.id", ondelete="CASCADE"), nullable=False
+    )
+    announcement_id = Column(
+        Integer, ForeignKey("announcements.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    friend = relationship("Friend", back_populates="announcement_allocations")
+    announcement = relationship("Announcement", back_populates="allocations")
+
+
 class Device(Base):
     __tablename__ = "devices"
     __table_args__ = (
@@ -168,6 +277,9 @@ class FetchLog(Base):
     target = Column(String(32), default="")
     ip = Column(String(64), default="")
     user_agent = Column(String(255), default="")
+    shared_fallback_count = Column(Integer, default=0, nullable=False)
+    skipped_node_count = Column(Integer, default=0, nullable=False)
+    expired_node_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
 
@@ -353,7 +465,7 @@ def migrate_database(engine):
                 )
             if not _column_exists(conn, "flow_records", "sample_key"):
                 conn.exec_driver_sql(
-                    "ALTER TABLE flow_records ADD COLUMN sample_key " "VARCHAR(128)"
+                    "ALTER TABLE flow_records ADD COLUMN sample_key VARCHAR(128)"
                 )
             conn.exec_driver_sql(
                 "CREATE TABLE IF NOT EXISTS node_metric_samples ("
@@ -494,8 +606,256 @@ def migrate_database(engine):
             )
             _mark_migration(conn, 4)
 
+        if current < 5:
+            if not _column_exists(conn, "nodes", "adapter_kind"):
+                conn.exec_driver_sql(
+                    "ALTER TABLE nodes ADD COLUMN adapter_kind "
+                    "VARCHAR(24) NOT NULL DEFAULT 'shared'"
+                )
+
+            # Preserve the legacy deployment's adapter assignments once,
+            # guarded by protocol so a reused row ID cannot inherit the wrong
+            # proxy implementation. Runtime code never depends on these IDs.
+            legacy_adapters = {
+                4: ("hysteria2", "local_hy2"),
+                5: ("vless", "remote_agent"),
+                6: ("hysteria2", "remote_agent"),
+                7: ("hysteria2", "remote_agent"),
+                8: ("hysteria2", "remote_agent"),
+                9: ("hysteria2", "remote_agent"),
+                10: ("hysteria2", "remote_agent"),
+                11: ("vless", "local_vless"),
+                12: ("vless", "remote_agent"),
+                13: ("vless", "remote_agent"),
+                14: ("vless", "remote_agent"),
+                15: ("vless", "remote_agent"),
+                16: ("vless", "remote_agent"),
+                17: ("vless", "remote_agent"),
+                18: ("hysteria2", "remote_agent"),
+            }
+            for node_id, (protocol, adapter_kind) in legacy_adapters.items():
+                conn.exec_driver_sql(
+                    "UPDATE nodes SET adapter_kind=? "
+                    "WHERE id=? AND lower(protocol)=? AND adapter_kind='shared'",
+                    (adapter_kind, node_id, protocol),
+                )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_local_hy2_adapter "
+                "ON nodes(adapter_kind) WHERE adapter_kind='local_hy2'"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_local_vless_adapter "
+                "ON nodes(adapter_kind) WHERE adapter_kind='local_vless'"
+            )
+            _mark_migration(conn, 5)
+
+        if current < 6:
+            for column, declaration in (
+                ("pending_token_hash", "VARCHAR(128)"),
+                ("pending_token_expires_at", "DATETIME"),
+                ("pending_token_last_seen", "DATETIME"),
+            ):
+                if not _column_exists(conn, "node_agents", column):
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE node_agents ADD COLUMN {column} {declaration}"
+                    )
+            _mark_migration(conn, 6)
+
+        if current < 7:
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS admin_login_throttles ("
+                "client_key VARCHAR(64) PRIMARY KEY, "
+                "failure_count INTEGER NOT NULL DEFAULT 0, "
+                "window_started_at DATETIME NOT NULL, "
+                "blocked_until DATETIME, "
+                "updated_at DATETIME NOT NULL)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_admin_login_throttles_updated_at "
+                "ON admin_login_throttles(updated_at)"
+            )
+            _mark_migration(conn, 7)
+
+        if current < 8:
+            if _table_exists(conn, "fetch_logs") and not _column_exists(
+                conn, "fetch_logs", "shared_fallback_count"
+            ):
+                conn.exec_driver_sql(
+                    "ALTER TABLE fetch_logs ADD COLUMN shared_fallback_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            _mark_migration(conn, 8)
+
+        if current < 9:
+            for table in ("nodes", "friends"):
+                if _table_exists(conn, table):
+                    if not _column_exists(conn, table, "expires_at"):
+                        conn.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN expires_at DATETIME"
+                        )
+                    if not _column_exists(conn, table, "updated_at"):
+                        conn.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN updated_at DATETIME"
+                        )
+                        conn.exec_driver_sql(
+                            f"UPDATE {table} SET updated_at=created_at "
+                            "WHERE updated_at IS NULL"
+                        )
+            _mark_migration(conn, 9)
+
+        if current < 10:
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS admin_audit_logs ("
+                "id INTEGER PRIMARY KEY, "
+                "actor_fingerprint VARCHAR(64) NOT NULL, "
+                "method VARCHAR(12) NOT NULL, "
+                "path VARCHAR(255) NOT NULL, "
+                "status_code INTEGER NOT NULL, "
+                "created_at DATETIME NOT NULL)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_admin_audit_logs_created_at "
+                "ON admin_audit_logs(created_at)"
+            )
+            conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS admin_audit_logs_no_update "
+                "BEFORE UPDATE ON admin_audit_logs BEGIN "
+                "SELECT RAISE(ABORT, 'admin audit log is append-only'); END"
+            )
+            conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS admin_audit_logs_no_delete "
+                "BEFORE DELETE ON admin_audit_logs BEGIN "
+                "SELECT RAISE(ABORT, 'admin audit log is append-only'); END"
+            )
+            _mark_migration(conn, 10)
+
+        if current < 11:
+            if _table_exists(conn, "fetch_logs") and not _column_exists(
+                conn, "fetch_logs", "expired_node_count"
+            ):
+                conn.exec_driver_sql(
+                    "ALTER TABLE fetch_logs ADD COLUMN expired_node_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            _mark_migration(conn, 11)
+
+        if current < 12:
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS admin_sessions ("
+                "session_hash VARCHAR(64) PRIMARY KEY, "
+                "created_at DATETIME NOT NULL, "
+                "expires_at DATETIME NOT NULL, "
+                "revoked_at DATETIME)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_admin_sessions_expires_at "
+                "ON admin_sessions(expires_at)"
+            )
+            _mark_migration(conn, 12)
+
+        if current < 13:
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS admin_auth_state ("
+                "id INTEGER PRIMARY KEY, "
+                "config_fingerprint VARCHAR(64) NOT NULL, "
+                "epoch VARCHAR(64) NOT NULL)"
+            )
+            _mark_migration(conn, 13)
+
+        if current < 14:
+            if _table_exists(conn, "nodes"):
+                if not _column_exists(conn, "nodes", "is_announcement"):
+                    conn.exec_driver_sql(
+                        "ALTER TABLE nodes ADD COLUMN is_announcement "
+                        "BOOLEAN NOT NULL DEFAULT 0"
+                    )
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS announcements ("
+                "id INTEGER PRIMARY KEY, "
+                "legacy_node_id INTEGER UNIQUE, "
+                "name VARCHAR(160) NOT NULL, "
+                "enabled BOOLEAN NOT NULL DEFAULT 1, "
+                "sort_order INTEGER NOT NULL DEFAULT 0, "
+                "created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_announcements_legacy_node_id "
+                "ON announcements(legacy_node_id)"
+            )
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS announcement_allocations ("
+                "id INTEGER PRIMARY KEY, "
+                "friend_id INTEGER NOT NULL REFERENCES friends(id) ON DELETE CASCADE, "
+                "announcement_id INTEGER NOT NULL REFERENCES announcements(id) ON DELETE CASCADE, "
+                "created_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_friend_announcement UNIQUE(friend_id, announcement_id))"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_announcement_allocations_friend_id "
+                "ON announcement_allocations(friend_id)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_announcement_allocations_announcement_id "
+                "ON announcement_allocations(announcement_id)"
+            )
+            if _table_exists(conn, "nodes"):
+                legacy_uri_prefix = (
+                    "vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE nodes SET is_announcement=1 "
+                    "WHERE lower(protocol)='vless' AND lower(server)='127.0.0.1' "
+                    "AND substr(uri, 1, ?) = ? "
+                    "AND substr(uri, ?, 1) IN ('?', '#', '')",
+                    (
+                        len(legacy_uri_prefix),
+                        legacy_uri_prefix,
+                        len(legacy_uri_prefix) + 1,
+                    ),
+                )
+                if _column_exists(conn, "nodes", "adapter_kind"):
+                    conn.exec_driver_sql(
+                        "UPDATE nodes SET adapter_kind='shared' WHERE is_announcement=1"
+                    )
+                if _column_exists(conn, "nodes", "per_user_enabled"):
+                    conn.exec_driver_sql(
+                        "UPDATE nodes SET per_user_enabled=0 WHERE is_announcement=1"
+                    )
+                conn.exec_driver_sql(
+                    "INSERT OR IGNORE INTO announcements "
+                    "(id, legacy_node_id, name, enabled, sort_order, created_at, updated_at) "
+                    "SELECT id, id, name, enabled, sort_order, created_at, updated_at "
+                    "FROM nodes WHERE is_announcement=1"
+                )
+                if _table_exists(conn, "allocations"):
+                    conn.exec_driver_sql(
+                        "INSERT OR IGNORE INTO announcement_allocations "
+                        "(friend_id, announcement_id, created_at) "
+                        "SELECT a.friend_id, n.id, a.created_at "
+                        "FROM allocations AS a JOIN nodes AS n ON n.id=a.node_id "
+                        "WHERE n.is_announcement=1"
+                    )
+            _mark_migration(conn, 14)
+
+        if current < 15:
+            if _table_exists(conn, "fetch_logs") and not _column_exists(
+                conn, "fetch_logs", "skipped_node_count"
+            ):
+                conn.exec_driver_sql(
+                    "ALTER TABLE fetch_logs ADD COLUMN skipped_node_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            _mark_migration(conn, 15)
+
 
 def make_session_factory(db_path):
+    db_path = str(db_path)
+    if db_path not in {":memory:", "sqlite://", "sqlite:///:memory:"}:
+        path = Path(db_path).expanduser()
+        if not path.is_absolute():
+            raise ValueError("SUB_APP_DB must be an absolute path")
+        db_path = str(path)
     engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False, "timeout": 30},
@@ -509,6 +869,12 @@ def make_session_factory(db_path):
         cur.execute("PRAGMA foreign_keys=ON")
         cur.execute("PRAGMA busy_timeout=30000")
         cur.close()
+
+    if db_path not in {":memory:", "sqlite://", "sqlite:///:memory:"}:
+        with engine.connect() as conn:
+            journal_mode = conn.exec_driver_sql("PRAGMA journal_mode=WAL").scalar()
+        if str(journal_mode).lower() != "wal":
+            raise RuntimeError("SQLite WAL mode could not be enabled")
 
     migrate_database(engine)
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)

@@ -11,73 +11,88 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
 
-from app.credentials import credential_stats_id, credential_values
+from app.account_policy import is_expired
+from app.converter import parse_uri
+from app.credentials import credential_stats_id, credential_values, deny_all_uuid
 from app.models import Friend, Node, NodeAgent, UserNodeCredential, utcnow
+from app.quota import flow_limit_reached
 
 ADAPTER_ENV_FILE = Path(
     os.environ.get("SUB_APP_PROXY_ADAPTERS_ENV", "/etc/sub-app/proxy-adapters.env")
 )
-VLESS_CONFIG = Path(
-    os.environ.get("SUB_APP_VLESS_CONFIG", "/etc/sing-box-reality/config.json")
+VLESS_SYNC_HELPER = Path(
+    os.environ.get(
+        "SUB_APP_VLESS_SYNC_HELPER", "/usr/local/libexec/sub-app-vless-sync-root.py"
+    )
 )
-VLESS_BINARY = os.environ.get("SUB_APP_VLESS_BINARY", "/usr/local/bin/sing-box-reality")
-VLESS_SERVICE = os.environ.get("SUB_APP_VLESS_SERVICE", "sing-box-reality.service")
-VLESS_LEGACY_HOURS = 24
+VLESS_SYNC_SOCKET = os.environ.get(
+    "SUB_APP_VLESS_SYNC_SOCKET", "/run/sub-app-vless-sync.sock"
+)
 
-LOCAL_SUPPORTED_NODES = {4, 11}
-
-REMOTE_AGENT_NODES = {
-    5: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    6: {
+ADAPTER_INFO = {
+    "local_hy2": {
         "protocol": "hysteria2",
         "source": "hysteria2",
-        "label": "Hysteria2 节点 Agent",
+        "label": "Hysteria2 HTTP auth",
     },
-    7: {
-        "protocol": "hysteria2",
-        "source": "hysteria2",
-        "label": "Hysteria2 节点 Agent",
+    "local_vless": {
+        "protocol": "vless",
+        "source": "vless",
+        "label": "VLESS V2Ray API",
     },
-    8: {
-        "protocol": "hysteria2",
-        "source": "hysteria2",
-        "label": "Hysteria2 节点 Agent",
-    },
-    9: {
-        "protocol": "hysteria2",
-        "source": "hysteria2",
-        "label": "Hysteria2 节点 Agent",
-    },
-    10: {
-        "protocol": "hysteria2",
-        "source": "hysteria2",
-        "label": "Hysteria2 节点 Agent",
-    },
-    12: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    13: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    14: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    15: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    16: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    17: {"protocol": "vless", "source": "vless", "label": "VLESS 节点 Agent"},
-    18: {
-        "protocol": "hysteria2",
-        "source": "hysteria2",
-        "label": "Hysteria2 节点 Agent",
+    "remote_agent": {
+        "protocols": {"vless", "hysteria2"},
+        "source": None,
+        "label": "节点 Agent",
     },
 }
 
-SUPPORTED_NODES = {
-    4: {"protocol": "hysteria2", "source": "hysteria2", "label": "Hysteria2 HTTP auth"},
-    11: {"protocol": "vless", "source": "vless", "label": "VLESS V2Ray API"},
-    **REMOTE_AGENT_NODES,
-}
+
+def adapter_info(node: Node) -> dict | None:
+    """Return protocol-specific adapter metadata stored on the node itself."""
+    info = ADAPTER_INFO.get(node.adapter_kind)
+    if not info:
+        return None
+    if node.adapter_kind == "remote_agent":
+        if node.protocol not in info["protocols"]:
+            return None
+        return {
+            "protocol": node.protocol,
+            "source": node.protocol,
+            "label": f"{node.protocol.upper()} 节点 Agent",
+        }
+    if node.protocol != info["protocol"]:
+        return None
+    return info
+
+
+def is_remote_agent(node: Node) -> bool:
+    return node.adapter_kind == "remote_agent" and adapter_info(node) is not None
+
+
+def is_local_vless(node: Node) -> bool:
+    return node.adapter_kind == "local_vless" and adapter_info(node) is not None
+
+
+def is_local_hy2(node: Node) -> bool:
+    return node.adapter_kind == "local_hy2" and adapter_info(node) is not None
+
+
+def is_supported_node(node: Node) -> bool:
+    return adapter_info(node) is not None
+
+
+def supported_node_ids(db) -> set[int]:
+    return {
+        node.id for node in db.scalars(select(Node)).all() if is_supported_node(node)
+    }
 
 
 def _read_env(path: Path = ADAPTER_ENV_FILE) -> dict[str, str]:
@@ -99,27 +114,29 @@ def adapter_marker() -> dict[str, str]:
     return _read_env()
 
 
-def adapter_ready(node_id: int, db=None) -> bool:
+def adapter_ready(node: Node, db=None) -> bool:
     values = adapter_marker()
-    if node_id == 4:
+    if is_local_hy2(node):
         return values.get("HY2_HTTP_AUTH") == "1"
-    if node_id == 11:
+    if is_local_vless(node):
         return values.get("VLESS_V2RAY_API") == "1"
-    if node_id in REMOTE_AGENT_NODES and db is not None:
-        agent = db.scalar(select(NodeAgent).where(NodeAgent.node_id == node_id))
-        if not agent or agent.status != "ready" or not agent.last_seen:
+    if is_remote_agent(node) and db is not None:
+        agent = db.scalar(select(NodeAgent).where(NodeAgent.node_id == node.id))
+        if not agent or agent.status not in {"observe", "ready"} or not agent.last_seen:
             return False
         last_seen = _db_utc(agent.last_seen)
-        return bool(
-            last_seen
-            and (utcnow().replace(tzinfo=None) - last_seen).total_seconds() <= 180
+        age = (
+            (utcnow().replace(tzinfo=None) - last_seen).total_seconds()
+            if last_seen
+            else None
         )
+        return age is not None and 0 <= age <= 180
     return False
 
 
 def node_per_user_enabled(node: Node) -> bool:
-    """Local US rollout stays enabled; remote nodes require an explicit flag."""
-    return node.id in LOCAL_SUPPORTED_NODES or bool(node.per_user_enabled)
+    """Local adapters are managed by the host; remote adapters are opt-in."""
+    return is_local_hy2(node) or is_local_vless(node) or bool(node.per_user_enabled)
 
 
 def _db_utc(value: datetime | None) -> datetime | None:
@@ -148,18 +165,27 @@ def legacy_hysteria_allowed(auth: str) -> bool:
 
 def authenticate_hysteria(db, auth: str) -> str | None:
     """Return the stats ID for a Hysteria auth payload, without logging it."""
+    node = db.scalar(
+        select(Node).where(
+            Node.adapter_kind == "local_hy2", Node.protocol == "hysteria2"
+        )
+    )
+    if node is None or not node.enabled or is_expired(node.expires_at):
+        return None
     if legacy_hysteria_allowed(auth):
         return "legacy-shared"
     if ":" not in auth:
         return None
     username, password = auth.split(":", 1)
+    node_id = node.id
     rows = db.execute(
         select(UserNodeCredential, Friend)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
-            UserNodeCredential.node_id == 4,
+            UserNodeCredential.node_id == node_id,
             UserNodeCredential.protocol == "hysteria2",
             UserNodeCredential.revoked_at.is_(None),
+            UserNodeCredential.status.in_(("active", "grace")),
             Friend.enabled.is_(True),
             Friend.per_user_credentials.is_(True),
         )
@@ -168,6 +194,10 @@ def authenticate_hysteria(db, auth: str) -> str | None:
     # naive UTC while keeping utcnow() itself timezone-aware for API output.
     now = utcnow().replace(tzinfo=None)
     for row, friend in rows:
+        if is_expired(friend.expires_at):
+            continue
+        if flow_limit_reached(db, friend):
+            continue
         grace_until = _db_utc(row.grace_until)
         if row.status == "grace" and (not grace_until or grace_until <= now):
             continue
@@ -182,44 +212,95 @@ def authenticate_hysteria(db, auth: str) -> str | None:
 
 
 def capability(node: Node, db=None) -> dict:
-    info = SUPPORTED_NODES.get(node.id)
-    if not info or node.protocol != info["protocol"]:
+    info = adapter_info(node)
+    if not info:
         return {
             "supported": False,
             "ready": False,
             "source": "shared",
             "label": "暂不支持按用户计量",
         }
+    ready = adapter_ready(node, db)
+    agent = (
+        db.scalar(select(NodeAgent).where(NodeAgent.node_id == node.id))
+        if is_remote_agent(node) and db is not None
+        else None
+    )
+    if is_remote_agent(node):
+        label = (
+            "Agent 在线，等待应用配置"
+            if ready and agent and agent.status == "observe"
+            else (info["label"] if ready else "等待节点 Agent 上报")
+        )
+    else:
+        label = info["label"]
     return {
         "supported": True,
-        "ready": adapter_ready(node.id, db),
+        "adapter_kind": node.adapter_kind,
+        "ready": ready,
+        "agent_status": agent.status if agent else None,
         "source": info["source"],
-        "label": (
-            info["label"]
-            if node.id in LOCAL_SUPPORTED_NODES or adapter_ready(node.id, db)
-            else "等待节点 Agent 上报并应用"
-        ),
+        "label": label,
     }
 
 
-def _run_check(config_path: Path) -> None:
-    result = subprocess.run(
-        [VLESS_BINARY, "check", "-c", str(config_path)],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    if result.returncode:
-        raise RuntimeError("sing-box 配置校验失败")
+def _apply_vless_sync(payload: dict) -> dict:
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    socket_path = Path(VLESS_SYNC_SOCKET)
+    if os.geteuid() == 0 and not socket_path.exists():
+        result = subprocess.run(
+            [
+                "/usr/bin/flock",
+                "--exclusive",
+                "--timeout",
+                "45",
+                "/var/lib/sub-app-vless-sync/sync.lock",
+                "/usr/bin/python3",
+                str(VLESS_SYNC_HELPER),
+            ],
+            input=body,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+        response = result.stdout
+        if result.returncode:
+            raise RuntimeError("VLESS root helper rejected the update")
+    else:
+        chunks = []
+        received = 0
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(45)
+            connection.connect(str(socket_path))
+            connection.sendall(body)
+            connection.shutdown(socket.SHUT_WR)
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > 65536:
+                    raise RuntimeError("VLESS root helper response is too large")
+                chunks.append(chunk)
+        response = b"".join(chunks)
+    try:
+        result = json.loads(response.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("VLESS root helper returned an invalid response") from exc
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError("VLESS root helper failed to apply the update")
+    return result
 
 
-def _live_vless_rows(db, extra: UserNodeCredential | None = None):
+def _live_vless_rows(db, node_id: int, extra: UserNodeCredential | None = None):
+    node = db.get(Node, node_id)
+    if node is None or not node.enabled or is_expired(node.expires_at):
+        return []
     rows = db.scalars(
         select(UserNodeCredential, Friend)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
-            UserNodeCredential.node_id == 11,
+            UserNodeCredential.node_id == node_id,
             UserNodeCredential.protocol == "vless",
             UserNodeCredential.revoked_at.is_(None),
             Friend.enabled.is_(True),
@@ -227,120 +308,95 @@ def _live_vless_rows(db, extra: UserNodeCredential | None = None):
         )
         .order_by(UserNodeCredential.friend_id, UserNodeCredential.version)
     ).all()
-    result = [row for row in rows if row.status == "active"]
     now = utcnow().replace(tzinfo=None)
+    result = [
+        row
+        for row in rows
+        if row.status == "active"
+        and not is_expired(row.friend.expires_at)
+        and not flow_limit_reached(db, row.friend)
+    ]
     for row in rows:
         grace_until = _db_utc(row.grace_until)
-        if row.status == "grace" and grace_until and grace_until > now:
+        if (
+            row.status == "grace"
+            and grace_until
+            and grace_until > now
+            and not is_expired(row.friend.expires_at)
+            and not flow_limit_reached(db, row.friend)
+        ):
             result.append(row)
-    if extra is not None and extra not in result:
+    if (
+        extra is not None
+        and extra not in result
+        and extra.revoked_at is None
+        and extra.friend.enabled
+        and extra.friend.per_user_credentials
+        and not is_expired(extra.friend.expires_at)
+        and not flow_limit_reached(db, extra.friend)
+    ):
         result.append(extra)
     return result
 
 
-def sync_vless_config(db, extra: UserNodeCredential | None = None) -> None:
-    """Atomically reconcile VLESS users and the loopback V2Ray API."""
+def sync_vless_config(
+    db, extra: UserNodeCredential | None = None, node: Node | None = None
+) -> None:
+    """Ask the fixed root helper to reconcile VLESS users safely."""
 
-    if not adapter_ready(11):
+    node = node or db.scalar(
+        select(Node).where(Node.adapter_kind == "local_vless", Node.protocol == "vless")
+    )
+    if node is None or not is_local_vless(node):
+        raise RuntimeError("未配置本机 VLESS 适配器节点")
+    if not adapter_ready(node, db):
         raise RuntimeError("VLESS V2Ray API 适配器未就绪")
-    try:
-        config = json.loads(VLESS_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise RuntimeError("无法读取 sing-box 配置") from exc
-
-    inbound = next(
-        (
-            item
-            for item in config.get("inbounds", [])
-            if item.get("tag") == "reality-in"
-        ),
-        None,
-    )
-    if not inbound or inbound.get("type") != "vless":
-        raise RuntimeError("找不到 reality-in VLESS 入站")
-    old_users = list(inbound.get("users", []))
-    marker = adapter_marker()
-    legacy_until = marker.get("VLESS_LEGACY_UNTIL", "")
-    keep_legacy = False
-    if legacy_until:
-        try:
-            keep_legacy = utcnow() < datetime.fromisoformat(
-                legacy_until.replace("Z", "+00:00")
-            )
-        except ValueError:
-            keep_legacy = False
-    flow = next((u.get("flow", "") for u in old_users if u.get("flow") is not None), "")
+    parsed = parse_uri(node.uri)
+    if not parsed or parsed.get("scheme") != "vless":
+        raise RuntimeError("本机 VLESS 节点链接无效")
+    flow = (parsed.get("params") or {}).get("flow", "")
+    if flow == "xtls-r-vision":
+        raise RuntimeError("VLESS flow xtls-r-vision 已不支持，请更新节点链接")
     users = []
-    if keep_legacy:
-        users.extend(
-            {k: user[k] for k in ("uuid", "flow") if k in user}
-            for user in old_users
-            # Named users are managed below from the database.  Only the
-            # original unnamed shared credential belongs to the compatibility
-            # window; preserving named users here would duplicate them after
-            # every sync.
-            if user.get("uuid") and not user.get("name")
-        )
-    for row in _live_vless_rows(db, extra=extra):
+    for row in _live_vless_rows(db, node.id, extra=extra):
         values = credential_values(row)
-        users.append(
-            {"name": credential_stats_id(row), "uuid": values["uuid"], "flow": flow}
-        )
-    if not users:
-        raise RuntimeError("VLESS 配置不能没有用户")
-    inbound["users"] = users
-
-    experimental = config.setdefault("experimental", {})
-    experimental["v2ray_api"] = {
-        "listen": "127.0.0.1:10085",
-        "stats": {
-            "enabled": True,
-            "inbounds": ["reality-in"],
-            "users": [u["name"] for u in users if u.get("name")],
-        },
-    }
-
-    fd, temp_name = tempfile.mkstemp(
-        prefix="config.", suffix=".json", dir=str(VLESS_CONFIG.parent)
+        user = {"name": credential_stats_id(row), "uuid": values["uuid"]}
+        if flow:
+            user["flow"] = flow
+        users.append(user)
+    _apply_vless_sync(
+        {
+            "enabled": bool(node.enabled and not is_expired(node.expires_at)),
+            "users": users,
+            "flow": flow,
+            "deny_all_uuid": deny_all_uuid(node.id),
+        }
     )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.chmod(temp_path, 0o600)
-        _run_check(temp_path)
-        os.replace(temp_path, VLESS_CONFIG)
-    finally:
-        temp_path.unlink(missing_ok=True)
-    restarted = subprocess.run(
-        ["systemctl", "restart", VLESS_SERVICE],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if restarted.returncode:
-        raise RuntimeError("sing-box 重启失败")
 
 
 def activate_credential(db, row: UserNodeCredential) -> UserNodeCredential:
-    if row.node_id in REMOTE_AGENT_NODES:
+    node = db.get(Node, row.node_id)
+    if node is None:
+        row.status = "error"
+        row.last_error = "凭据关联的节点不存在"
+        row.last_synced_at = None
+        return row
+    if is_remote_agent(node):
         row.status = "pending"
         row.last_error = "等待节点 Agent 应用期望配置"
         row.last_synced_at = None
         return row
-    if not adapter_ready(row.node_id, db):
+    if not adapter_ready(node, db):
         row.status = "error"
         row.last_error = "节点适配器未就绪"
         row.last_synced_at = None
         return row
-    if row.node_id == 11:
+    if is_local_vless(node):
         row.status = "active"
         row.last_error = ""
         db.flush()
         try:
-            sync_vless_config(db, extra=row)
+            sync_vless_config(db, extra=row, node=node)
         except Exception as exc:
             row.status = "error"
             row.last_error = str(exc)[:1000]
