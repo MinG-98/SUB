@@ -91,6 +91,7 @@ def test_install_writes_only_managed_units_and_private_config(monkeypatch, tmp_p
 def args():
     return Namespace(
         name="test-hy2",
+        region="SG",
         public_host="test.invalid",
         public_port=28443,
         listen_port=8443,
@@ -108,6 +109,17 @@ def test_existing_endpoint_never_mutated():
 
     with pytest.raises(RuntimeError, match="不.*接管"):
         boot.provision(args(), api)
+
+
+def test_canonical_names_follow_highest_existing_number():
+    nodes = [
+        {"name": "01｜🇺🇸 US-Hy2"},
+        {"name": "08｜🇺🇸 美国 Reality"},
+        {"name": "15｜🇸🇬 新加坡 Hy2"},
+        {"name": "not-numbered"},
+    ]
+    assert boot.canonical_hy2_name(nodes, "SG") == "16｜🇸🇬 新加坡 Hy2"
+    assert boot.canonical_hy2_name(nodes, "JP") == "16｜🇯🇵 日本 Hy2"
 
 
 @pytest.mark.parametrize(
@@ -151,6 +163,7 @@ def test_digest_mismatch_never_executes_binary_or_installs_units(monkeypatch, tm
 
 def test_secrets_in_stdin_not_ssh_argv(monkeypatch):
     a = args()
+    a.region = "SG"
     a.cert, a.key, a.acme_email = "/etc/c", "/etc/k", None
     a.identity, a.ssh_port, a.ssh_host = "/local/key", 2222, "test.invalid"
 
