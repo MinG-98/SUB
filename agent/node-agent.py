@@ -30,7 +30,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MAX_PENDING_TRAFFIC_RECORDS = 2048
 MAX_TRAFFIC_BATCH_RECORDS = 128
 
@@ -344,6 +344,7 @@ class Agent:
             # True when this node's Hysteria2 is an inbound inside sing-box
             # rather than a standalone hysteria server.
             "singbox_engine": self._singbox_engine(spec),
+            "xray_engine": spec.get("engine") == "xray",
             "systemd": bool(shutil.which("systemctl")),
             "openrc": bool(shutil.which("rc-service")),
         }
@@ -730,6 +731,103 @@ class Agent:
             raise RuntimeError("sing-box service failed after config apply")
         self.save_state()
 
+    def apply_xray(self, spec: dict, desired: dict) -> None:
+        """Adopt an explicitly selected native Xray Reality inbound (not sing-box)."""
+        path = Path(spec["xray_config"])
+        binary = str(spec.get("xray_binary", "xray"))
+        tag, port = spec.get("inbound_tag"), spec.get("inbound_port")
+        config = json.loads(path.read_text(encoding="utf-8"))
+        targets = [
+            item
+            for item in config.get("inbounds", [])
+            if (tag or port)
+            and item.get("protocol") == "vless"
+            and item.get("streamSettings", {}).get("security") == "reality"
+            and (not tag or item.get("tag") == tag)
+            and (not port or str(item.get("port")) == str(port))
+        ]
+        if len(targets) != 1:
+            raise RuntimeError("expected exactly one selected Xray Reality inbound")
+        settings = targets[0]["settings"]
+        user_fields = [key for key in ("clients", "users") if key in settings]
+        if len(user_fields) != 1 or not isinstance(settings[user_fields[0]], list):
+            raise RuntimeError("ambiguous or missing Xray user list")
+        field = user_fields[0]
+        state = self.node_state(int(spec["node_id"]))
+        mode = desired.get("mode")
+        if mode not in {"disabled", "shared", "per_user"} or not isinstance(
+            desired.get("users"), list
+        ):
+            raise ValueError("invalid Xray desired state")
+        if "xray_legacy" not in state:
+            original = settings[field]
+            # An unmanaged pre-existing fleet or lost Agent state requires an
+            # operator, not a new grace period for possibly revoked UUIDs.
+            if len(original) > 1 or any(
+                not item.get("id")
+                or re.fullmatch(
+                    r"f\d+n\d+v\d+|sub-app-disabled-.*|legacy-shared",
+                    str(item.get("email", "")),
+                )
+                for item in original
+            ):
+                raise RuntimeError("refusing to adopt existing Xray managed users")
+            state["xray_legacy"] = copy.deepcopy(original)
+            state["xray_legacy_until"] = utcnow().timestamp() + 86400
+            self.save_state()
+        legacy = state["xray_legacy"]
+        flow = legacy[0].get("flow", "") if legacy else ""
+        clients = {}
+        if mode == "per_user" and utcnow().timestamp() < state["xray_legacy_until"]:
+            clients.update((u["id"], copy.deepcopy(u)) for u in legacy)
+        if mode != "disabled":
+            for item in desired["users"]:
+                uid, name = str(uuid.UUID(item["uuid"])), item["stats_id"]
+                if not name or item.get("protocol", "vless") != "vless":
+                    raise ValueError("invalid Xray desired user")
+                entry = {"id": uid, "email": name}
+                effective_flow = item.get("flow", "") if mode == "shared" else flow
+                if effective_flow:
+                    entry["flow"] = effective_flow
+                clients[uid] = entry
+        if not clients:
+            deny = self._deny_all_user(state, "vless")
+            clients[deny["uuid"]] = {"id": deny["uuid"], "email": deny["name"]}
+        original_config = copy.deepcopy(config)
+        settings[field] = list(clients.values())
+        listen = str(spec.get("v2ray_api_listen", "127.0.0.1:10085"))
+        match = re.fullmatch(r"127\.0\.0\.1:(\d{1,5})", listen)
+        if not match or not 1 <= int(match[1]) <= 65535:
+            raise ValueError("Xray stats must use IPv4 loopback")
+        api = config.setdefault(
+            "api",
+            {"tag": "sub-app-stats", "listen": listen, "services": ["StatsService"]},
+        )
+        if api.get("listen") != listen or "StatsService" not in api.get("services", []):
+            raise RuntimeError("refusing to replace an existing Xray API")
+        config.setdefault("stats", {})
+        level = (
+            config.setdefault("policy", {}).setdefault("levels", {}).setdefault("0", {})
+        )
+        level.update(statsUserUplink=True, statsUserDownlink=True)
+        if original_config == config:
+            return
+        content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        # Validate the entire candidate with the actual engine before changing
+        # the live file; Xray determines the config format from the extension.
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", dir=path.parent
+        ) as temp:
+            temp.write(content)
+            temp.flush()
+            if not command_ok([binary, "run", "-test", "-c", temp.name]):
+                raise RuntimeError("Xray candidate failed validation")
+        self.save_state()
+        backup = self._backup_and_replace(path, content, spec)
+        if not self._service_restart(spec):
+            self._restore(path, backup, spec)
+            raise RuntimeError("Xray service failed after config apply")
+
     def collect_vless_traffic(self, spec: dict) -> list[dict]:
         """Read per-user counters from the loopback V2Ray API via the helper.
 
@@ -741,6 +839,9 @@ class Agent:
         binary = str(
             spec.get("vless_stats_binary", "/usr/local/libexec/sub-app-vless-stats")
         )
+        native = spec.get("engine") == "xray"
+        if native:
+            binary = shutil.which(spec.get("xray_binary", "xray")) or ""
         if not os.path.exists(binary):
             return []
         listen = str(spec.get("v2ray_api_listen", "127.0.0.1:10085"))
@@ -750,7 +851,27 @@ class Agent:
         )
         if time.monotonic() < retry_after:
             return []
-        raw = command_output([binary, "-addr", listen], timeout=10)
+        if native:
+            if not re.fullmatch(r"127\.0\.0\.1:\d{1,5}", listen):
+                return []
+            try:
+                raw = subprocess.check_output(
+                    [
+                        binary,
+                        "api",
+                        "statsquery",
+                        "--server=" + listen,
+                        "-pattern",
+                        "user>>>",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    text=True,
+                )
+            except (OSError, subprocess.SubprocessError):
+                raw = ""
+        else:
+            raw = command_output([binary, "-addr", listen], timeout=10)
         retry_cache = getattr(self, "_traffic_probe_retry_after", None)
         if retry_cache is None:
             retry_cache = {}
@@ -763,11 +884,11 @@ class Agent:
             return []
         retry_cache.pop(probe_key, None)
         try:
-            payload = json.loads(raw.strip().splitlines()[0]) if raw.strip() else {}
+            payload = json.loads(raw if native else raw.strip().splitlines()[0])
         except (ValueError, IndexError):
             retry_cache[probe_key] = time.monotonic() + 60
             return []
-        entries = payload.get("stats")
+        entries = payload.get("stat", []) if native else payload.get("stats")
         if not isinstance(entries, list):
             retry_cache[probe_key] = time.monotonic() + 60
             return []
@@ -970,6 +1091,8 @@ class Agent:
                     self.apply_singbox_hysteria2(spec, desired)
                 elif protocol == "hysteria2":
                     self.apply_hysteria(spec, desired)
+                elif protocol == "vless" and spec.get("engine") == "xray":
+                    self.apply_xray(spec, desired)
                 elif protocol == "vless":
                     self.apply_vless(spec, desired)
                 else:
