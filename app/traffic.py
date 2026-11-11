@@ -104,14 +104,15 @@ def normalize_server(item: dict) -> dict:
         online_value = status.get("online", status.get("active"))
     if online_value is None and isinstance(status, str):
         online_value = status
-    if online_value is None and isinstance(state, dict):
-        # Nezha V2 puts the latest agent metrics in `state`; an empty state
-        # means the agent has no current heartbeat in the inventory response.
-        online_value = bool(state)
     if online_value is None and last_active is not None:
         online_value = (
             datetime.now(timezone.utc) - last_active
         ).total_seconds() <= POLL_SECONDS * 2
+    if online_value is None and isinstance(state, dict):
+        # Some Nezha responses contain a retained state snapshot after the
+        # agent has stopped reporting. Prefer an explicit heartbeat timestamp
+        # when available; use state presence only when that timestamp is absent.
+        online_value = bool(state)
 
     def metric_value(*keys):
         for key in keys:
