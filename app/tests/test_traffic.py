@@ -20,6 +20,36 @@ def test_naive_utc_converts_offset_aware_values_to_utc():
     assert traffic._naive_utc(value) == datetime(2026, 8, 20, 15, 35)
 
 
+def test_stale_nezha_last_active_overrides_nonempty_state():
+    stale = datetime.now(timezone.utc) - timedelta(days=35)
+
+    result = traffic.normalize_server(
+        {
+            "id": 13,
+            "last_active": stale,
+            "state": {"cpu": 0.25},
+        }
+    )
+
+    assert result["online"] is False
+    assert result["last_active"] == stale
+
+
+def test_explicit_nezha_online_value_takes_precedence_over_old_timestamp():
+    stale = datetime.now(timezone.utc) - timedelta(days=35)
+
+    result = traffic.normalize_server(
+        {
+            "id": 13,
+            "online": True,
+            "last_active": stale,
+            "state": {"cpu": 0.25},
+        }
+    )
+
+    assert result["online"] is True
+
+
 def test_collector_records_actual_finish_time(tmp_path, monkeypatch):
     db = make_session_factory(str(tmp_path / "collector.db"))()
     try:
