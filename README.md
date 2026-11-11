@@ -96,7 +96,7 @@ WantedBy=timers.target
 
 示例、证书/端口映射准备、失败处理和支持边界见 [新节点部署手册](deploy/NEW-NODE.md)。脚本不会接管现有 Xray/sing-box/Hy2 服务器，不会修改 SSH、系统防火墙、提供商 NAT 映射或 DNS，也**不会给新节点分配用户**。未提供 `--client` 执行公网客户端探测时，成功输出不代表公网代理链路已验证。VLESS/Xray 新机自动部署目前不支持。
 
-订阅公告使用独立的 `announcements` 与 `announcement_allocations` 表，不参与节点采集、探测、适配器和流量统计；公告仍按订阅格式输出兼容的提示条目。SQLite v14 仅迁移旧版本明确生成的固定占位 URI，并复制原有用户分配；旧 Node 行和原分配记录保留作兼容核对，不会因迁移级联删除。
+订阅公告使用独立的 `announcements` 与 `announcement_allocations` 表，不参与节点采集、探测、适配器和流量统计；公告仍按订阅格式输出兼容的提示条目。SQLite v14 迁移旧版本明确生成的端口 1 占位 URI；v16 幂等核验端口 1，并补迁移同一全零 UUID / `127.0.0.1` 的端口 2、3 占位 URI，严格检查端口边界后复制原有用户分配。旧 Node 行和原分配记录保留作兼容核对，不会因迁移级联删除。
 
 远程 Agent 注册使用 `POST /api/admin/agents`，明文 token 仅返回一次且响应禁止缓存；注册不会启用用户级凭据。节点侧配置需要由操作者按实际服务名、代理引擎和配置路径补齐，不能仅从订阅 URI 推断。轮换先生成 24 小时有效的观察 token，旧 token 继续有效；新 token 成功心跳后由管理员确认切换，确认后旧 token 即失效。完整节点侧字段见 [agent/README.md](agent/README.md)。
 
