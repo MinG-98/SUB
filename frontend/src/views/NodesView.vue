@@ -333,7 +333,11 @@ onMounted(load);
       </div>
       <div class="table-cell"><strong>{{ node.protocol }}</strong><span>{{ node.server }}:{{ node.port }}</span></div>
       <div class="table-cell table-flow"><strong>{{ formatBytes(node.traffic?.['24h']?.total || 0) }}</strong><div class="bar table-bar"><i :style="{ '--meter': `${Math.max(2, Math.round((Number(node.traffic?.['24h']?.total || 0) / maxTraffic) * 100))}%` }"></i></div></div>
-      <div class="table-cell"><strong class="table-state" :class="statusTone(node)">{{ nodeStatus(node).text }}</strong><span>{{ node.collector?.last_active ? timeAgo(node.collector.last_active) : "尚未上报" }}</span></div>
+      <div class="table-cell">
+        <strong class="table-state" :class="statusTone(node)">{{ nodeStatus(node).text }}</strong>
+        <span v-if="node.updated_at">配置更新：{{ timeAgo(node.updated_at) }}</span>
+        <span>哪吒上次活跃：{{ node.collector?.last_active ? timeAgo(node.collector.last_active) : (node.collector?.mapped ? "暂无历史时间" : "未关联") }}</span>
+      </div>
       <div class="table-actions"><button class="b b-am" @click="openEdit(node)">查看与编辑</button></div>
     </article>
   </div>
