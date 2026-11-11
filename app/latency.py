@@ -61,6 +61,9 @@ HYSTERIA_BIN = os.environ.get("SUB_APP_HYSTERIA_BIN", "/usr/local/bin/hysteria")
 SING_BOX_BIN = os.environ.get(
     "SUB_APP_SING_BOX_PROBE_BIN", "/usr/local/libexec/sub-app-sing-box-probe"
 )
+XRAY_PROBE_BIN = os.environ.get(
+    "SUB_APP_XRAY_PROBE_BIN", "/usr/local/libexec/sub-app-xray-probe"
+)
 
 HYSTERIA_CONNECTED_RE = re.compile(r"connected to server", re.IGNORECASE)
 HY2_HANDSHAKE_TIMEOUT = 10.0
@@ -628,6 +631,186 @@ def _sing_box_config(parsed: dict, port: int) -> dict:
     }
 
 
+def _xray_reality_config(parsed: dict, port: int) -> dict:
+    """Build a restricted Xray client config for REALITY proxy-exit probes.
+
+    sing-box currently strips the X25519MLKEM768 key share that newer Xray
+    REALITY servers require. Xray itself is the compatibility reference for
+    this probe path; the VLESS credential is kept only in the mode-0600
+    temporary config created by _xray_probe.
+    """
+    params = parsed.get("params", {})
+    if parsed.get("scheme") != "vless" or params.get("security") != "reality":
+        raise ValueError("Xray probe supports VLESS REALITY only")
+
+    network = params.get("type", "tcp").lower()
+    network = {"tcp": "raw", "raw": "raw", "grpc": "grpc"}.get(network)
+    if network is None:
+        raise ValueError("unsupported VLESS REALITY transport")
+
+    server_name = params.get("sni", "")
+    public_key = params.get("pbk", "")
+    user_id = parsed.get("user", "")
+    if not server_name or not public_key or not user_id:
+        raise ValueError("incomplete VLESS REALITY parameters")
+
+    user = {"id": user_id, "encryption": "none"}
+    if params.get("flow"):
+        user["flow"] = params["flow"]
+
+    stream_settings = {
+        "network": network,
+        "security": "reality",
+        "realitySettings": {
+            "serverName": server_name,
+            "fingerprint": params.get("fp") or "chrome",
+            # Xray renamed the client-side publicKey field to password.
+            "password": public_key,
+            "shortId": params.get("sid", ""),
+            "spiderX": params.get("spx", ""),
+        },
+    }
+    if network == "grpc":
+        stream_settings["grpcSettings"] = {"serviceName": params.get("serviceName", "")}
+
+    return {
+        "log": {"loglevel": "none"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": False},
+            }
+        ],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": parsed["host"],
+                            "port": int(parsed["port"]),
+                            "users": [user],
+                        }
+                    ]
+                },
+                "streamSettings": stream_settings,
+            }
+        ],
+    }
+
+
+def _xray_probe(parsed: dict) -> dict:
+    if not parsed.get("user") or not Path(XRAY_PROBE_BIN).is_file():
+        return _result("unsupported", reason="Xray REALITY 探测器未就绪", source="xray")
+
+    port_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port_sock.bind(("127.0.0.1", 0))
+    port = port_sock.getsockname()[1]
+    port_sock.close()
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(TMP_ROOT, 0o700)
+    path = None
+    process = None
+    try:
+        fd, name = tempfile.mkstemp(
+            prefix="vless-xray-", suffix=".json", dir=str(TMP_ROOT)
+        )
+        path = Path(name)
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(_xray_reality_config(parsed, port), handle, ensure_ascii=False)
+        process = subprocess.Popen(
+            [XRAY_PROBE_BIN, "run", "-config", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        ready = False
+        for _ in range(40):
+            if process.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    ready = True
+                    break
+            except OSError:
+                time.sleep(0.1)
+        if not ready:
+            return _result("bad", reason="Xray 探测器未启动", source="xray")
+
+        curl = shutil.which("curl") or "/usr/bin/curl"
+        started = time.perf_counter()
+        completed = subprocess.run(
+            [
+                curl,
+                "--proxy",
+                f"socks5h://127.0.0.1:{port}",
+                "--noproxy",
+                "",
+                "-sS",
+                "-o",
+                os.devnull,
+                "-w",
+                "%{http_code}",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "12",
+                TARGET_URL,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=18,
+            check=False,
+        )
+        code = (completed.stdout or "").strip()
+        if completed.returncode == 0 and code[:1] in {"2", "3"}:
+            return _result(
+                "ok",
+                max(1, round((time.perf_counter() - started) * 1000)),
+                source="xray",
+            )
+        return _result("bad", reason="VLESS 代理出口失败", source="xray")
+    except subprocess.TimeoutExpired:
+        return _result("bad", reason="代理出口超时", source="xray")
+    except (OSError, ValueError, TypeError):
+        return _result("bad", reason="VLESS Xray 探测失败", source="xray")
+    finally:
+        if process is not None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=3)
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def _vless_probe(parsed: dict) -> dict:
+    params = parsed.get("params", {})
+    network = params.get("type", "tcp").lower()
+    if params.get("security") == "reality":
+        if network not in {"tcp", "raw", "grpc"}:
+            return _result(
+                "unsupported",
+                reason="VLESS REALITY 探测器暂不支持该传输",
+                source="xray",
+            )
+        if Path(XRAY_PROBE_BIN).is_file():
+            return _xray_probe(parsed)
+    return _sing_box_probe(parsed)
+
+
 def _sing_box_probe(parsed: dict) -> dict:
     if not parsed.get("user") or not Path(SING_BOX_BIN).is_file():
         return _result("unsupported", reason="VLESS 探测器未就绪", source="sing-box")
@@ -735,7 +918,7 @@ def _probe_node(node: dict) -> dict:
         entry, proxy = _hysteria_probe_results(parsed)
     elif protocol == "vless":
         entry = _socket_probe(parsed["host"], int(parsed["port"]))
-        proxy = _sing_box_probe(parsed)
+        proxy = _vless_probe(parsed)
     else:
         entry = _socket_probe(parsed["host"], int(parsed["port"]))
         proxy = _result("unsupported", reason="协议暂未适配", source="probe")

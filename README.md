@@ -57,7 +57,9 @@
 | `scripts/nezha_collector.py` | 单次采集哪吒整机状态与流量 | `NEZHA_BASE_URL`、`NEZHA_API_TOKEN`（或写入 `NEZHA_ENV_FILE` 指向的文件，默认为 `/etc/sub-app/nezha.env`） |
 | `scripts/proxy_collector.py` | 单次采集 Hysteria2/VLESS 用户级流量计数器 | `SUB_APP_VLESS_STATS_BINARY`（默认 `/usr/local/libexec/sub-app-vless-stats`）、`SUB_APP_PROXY_STATUS` |
 | `scripts/reconciler.py` | 将用户分配与本机代理适配器配置做最终一致性协调（新增/轮换/吊销凭据的重试循环） | `SUB_APP_PROXY_ADAPTERS_ENV`（默认 `/etc/sub-app/proxy-adapters.env`）、`SUB_APP_RECONCILER_STATUS` |
-| `scripts/latency_probe.py` | 触发一次真实延迟探测（控制面/节点入口/代理出口） | `SUB_APP_LATENCY_STATUS`、`SUB_APP_LATENCY_LOCK`、`SUB_APP_HYSTERIA_BIN`、`SUB_APP_SING_BOX_PROBE_BIN` |
+| `scripts/latency_probe.py` | 触发一次真实延迟探测（控制面/节点入口/代理出口） | `SUB_APP_LATENCY_STATUS`、`SUB_APP_LATENCY_LOCK`、`SUB_APP_HYSTERIA_BIN`、`SUB_APP_SING_BOX_PROBE_BIN`、`SUB_APP_XRAY_PROBE_BIN` |
+
+VLESS REALITY 出口优先使用官方 Xray 客户端探针（默认 `/usr/local/libexec/sub-app-xray-probe`），避免 sing-box 与 Xray 新版 REALITY 的 ML-KEM ClientHello 差异造成误报。Linux x86-64 可在部署机上运行 `sudo bash ./scripts/install_xray_probe.sh` 安装固定版本并校验 SHA-256；其他架构应自行安装受信任的 Xray 版本并通过 `SUB_APP_XRAY_PROBE_BIN` 指定路径。未安装时，现有 sing-box 探针仍作为回退。
 
 生产服务启动前会检查 `SUB_APP_DB` 指向的数据库。已有应用表但两张核心表都没有记录时，默认拒绝启动，以免误把空库当成正式数据；只有在明确创建全新空实例时，才可临时在 `/etc/sub-app/app.env` 设置 `SUB_APP_ALLOW_EMPTY_DB=1` 完成首次初始化，确认数据已创建后应移除此项。
 
