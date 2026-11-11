@@ -848,6 +848,52 @@ def migrate_database(engine):
                 )
             _mark_migration(conn, 15)
 
+        if current < 16:
+            if _table_exists(conn, "nodes"):
+                legacy_uri_prefixes = (
+                    "vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1",
+                    "vless://00000000-0000-0000-0000-000000000000@127.0.0.1:2",
+                    "vless://00000000-0000-0000-0000-000000000000@127.0.0.1:3",
+                )
+                for legacy_uri_prefix in legacy_uri_prefixes:
+                    conn.exec_driver_sql(
+                        "UPDATE nodes SET is_announcement=1 "
+                        "WHERE lower(protocol)='vless' AND lower(server)='127.0.0.1' "
+                        "AND substr(uri, 1, ?) = ? "
+                        "AND substr(uri, ?, 1) IN ('?', '#', '')",
+                        (
+                            len(legacy_uri_prefix),
+                            legacy_uri_prefix,
+                            len(legacy_uri_prefix) + 1,
+                        ),
+                    )
+                if _column_exists(conn, "nodes", "adapter_kind"):
+                    conn.exec_driver_sql(
+                        "UPDATE nodes SET adapter_kind='shared' WHERE is_announcement=1"
+                    )
+                if _column_exists(conn, "nodes", "per_user_enabled"):
+                    conn.exec_driver_sql(
+                        "UPDATE nodes SET per_user_enabled=0 WHERE is_announcement=1"
+                    )
+                if _table_exists(conn, "announcements"):
+                    conn.exec_driver_sql(
+                        "INSERT OR IGNORE INTO announcements "
+                        "(legacy_node_id, name, enabled, sort_order, created_at, updated_at) "
+                        "SELECT id, name, enabled, sort_order, created_at, updated_at "
+                        "FROM nodes WHERE is_announcement=1"
+                    )
+                    if _table_exists(conn, "allocations") and _table_exists(
+                        conn, "announcement_allocations"
+                    ):
+                        conn.exec_driver_sql(
+                            "INSERT OR IGNORE INTO announcement_allocations "
+                            "(friend_id, announcement_id, created_at) "
+                            "SELECT a.friend_id, n.id, a.created_at "
+                            "FROM allocations AS a "
+                            "JOIN announcements AS n ON n.legacy_node_id=a.node_id"
+                        )
+            _mark_migration(conn, 16)
+
 
 def make_session_factory(db_path):
     db_path = str(db_path)

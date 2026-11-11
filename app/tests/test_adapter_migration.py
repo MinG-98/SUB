@@ -78,7 +78,7 @@ def test_v4_adapter_migration_backfills_only_matching_existing_rows():
             versions = conn.exec_driver_sql(
                 "SELECT MAX(version) FROM schema_migrations"
             ).scalar_one()
-            assert versions == 15
+            assert versions == 16
             node_columns = {
                 row[1] for row in conn.exec_driver_sql("PRAGMA table_info(nodes)")
             }
