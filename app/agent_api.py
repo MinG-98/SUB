@@ -148,6 +148,7 @@ def _desired_users(db, node_id: int) -> list[dict]:
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
             UserNodeCredential.node_id == node_id,
+            UserNodeCredential.protocol == node.protocol,
             UserNodeCredential.revoked_at.is_(None),
             UserNodeCredential.status.in_(
                 (*ACTIVE_CREDENTIAL_STATUSES, "pending", "error")
@@ -275,9 +276,11 @@ def _record_traffic(db, node_id: int, payload) -> tuple[int, list[str]]:
         return 0, []
     rows = db.scalars(
         select(UserNodeCredential)
+        .join(Node, Node.id == UserNodeCredential.node_id)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
             UserNodeCredential.node_id == node_id,
+            UserNodeCredential.protocol == Node.protocol,
             UserNodeCredential.revoked_at.is_(None),
             UserNodeCredential.status.in_(ACTIVE_CREDENTIAL_STATUSES),
             Friend.enabled.is_(True),
@@ -364,9 +367,11 @@ def _mark_applied(
         return 0
     query = (
         select(UserNodeCredential)
+        .join(Node, Node.id == UserNodeCredential.node_id)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
             UserNodeCredential.node_id == node_id,
+            UserNodeCredential.protocol == Node.protocol,
             UserNodeCredential.revoked_at.is_(None),
             UserNodeCredential.status.in_(APPLICABLE_CREDENTIAL_STATUSES),
             Friend.enabled.is_(True),

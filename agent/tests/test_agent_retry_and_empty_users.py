@@ -92,6 +92,43 @@ def test_empty_remote_users_apply_stable_unadvertised_deny_all_users(
     )
 
 
+def test_persisted_malformed_managed_hy2_legacy_user_is_not_reinstalled(
+    tmp_path, monkeypatch
+):
+    _patch_singbox(monkeypatch, [])
+    bad = {"name": "f1n42v1", "password": ":"}
+    shared = {"name": "shared", "password": "fixture-shared"}
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"tag": "hy2-in", "type": "hysteria2", "users": [bad, shared]}
+                ]
+            }
+        )
+    )
+    agent = _agent(
+        tmp_path,
+        {
+            "nodes": {
+                "42": {
+                    "legacy_users": [bad, shared],
+                    "legacy_until": "2999-01-01T00:00:00+00:00",
+                }
+            }
+        },
+    )
+    spec = {
+        "node_id": 42,
+        "inbound_tag": "hy2-in",
+        "sing_box_config": str(path),
+        "backup_dir": str(tmp_path / "backups"),
+    }
+    agent.apply_singbox_hysteria2(spec, {"users": []})
+    assert json.loads(path.read_text())["inbounds"][0]["users"] == [shared]
+
+
 def test_vless_empty_users_apply_stable_unadvertised_deny_all_user(
     tmp_path, monkeypatch
 ):

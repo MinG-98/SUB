@@ -1230,6 +1230,18 @@ def update_node(
             raise HTTPException(400, "无法解析该节点链接")
     requested_kind = payload.get("adapter_kind", node.adapter_kind)
     requested_protocol = parsed_uri["scheme"] if parsed_uri else node.protocol
+    if requested_protocol != node.protocol:
+        has_agent = db.scalar(select(NodeAgent.id).where(NodeAgent.node_id == node.id))
+        has_history = db.scalar(
+            select(UserNodeCredential.id)
+            .where(UserNodeCredential.node_id == node.id)
+            .limit(1)
+        )
+        if has_agent or has_history:
+            raise HTTPException(
+                409,
+                "节点已有 Agent 或凭据历史，不能直接更换协议；请创建替代节点，验证后迁移分配。",
+            )
     if not isinstance(requested_kind, str):
         raise HTTPException(422, "adapter_kind 必须是字符串")
     if requested_kind not in {"shared", "local_hy2", "local_vless", "remote_agent"}:
@@ -1870,6 +1882,10 @@ def rotate_credential(credential_id: int, db=Depends(get_db), _=Depends(require_
     node = db.get(Node, old.node_id)
     if not friend or not node:
         raise HTTPException(404, "用户或节点不存在")
+    if old.protocol != node.protocol:
+        raise HTTPException(
+            409, "凭据协议与节点不一致，不能轮换；请使用当前协议准备凭据"
+        )
     if not friend.enabled or not friend.per_user_credentials:
         raise HTTPException(409, "用户未启用独立凭据")
     latest = db.scalar(
@@ -2175,7 +2191,12 @@ def subscription(
             select(func.count(Device.id)).where(Device.friend_id == friend.id)
         )
         if friend.device_limit and existing >= friend.device_limit:
-            raise HTTPException(403, "设备数已达上限")
+            raise HTTPException(
+                403,
+                "设备数已达上限；网络或客户端变化可能被识别为新设备。"
+                "请管理员在设备页将对应旧记录转为专属链接，再导入客户端，无需删除历史。",
+                headers={"x-sub-app-error-code": "device_limit_reached"},
+            )
         dev = Device(
             friend_id=friend.id,
             fingerprint=fp,
@@ -2263,6 +2284,7 @@ def subscription(
             .where(
                 UserNodeCredential.friend_id == friend.id,
                 UserNodeCredential.node_id == node.id,
+                UserNodeCredential.protocol == node.protocol,
                 UserNodeCredential.revoked_at.is_(None),
                 UserNodeCredential.status == "active",
             )
@@ -2272,7 +2294,12 @@ def subscription(
         if row is None:
             skipped_nodes.append(node.id)
             continue
-        uris.append(render_credential_uri(node, row))
+        try:
+            uris.append(render_credential_uri(node, row))
+        except ValueError:
+            # Historical inconsistent metadata must not break healthy nodes or
+            # weaken authentication by falling back to a shared credential.
+            skipped_nodes.append(node.id)
     fetch_log.shared_fallback_count = len(shared_fallback_nodes)
     fetch_log.skipped_node_count = len(skipped_nodes)
     fetch_log.expired_node_count = len(expired_nodes)
