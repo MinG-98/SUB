@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { api } from "../api.js";
 import { formatBytes, timeAgo } from "../format.js";
 import { pushToast } from "../store.js";
@@ -24,6 +24,60 @@ const formError = ref("");
 const credentials = ref([]);
 const credentialsLoading = ref(false);
 const credentialBusy = ref({});
+
+const diagnosticsFriend = ref(null);
+const diagnosticsTarget = ref("shadowrocket");
+const diagnosticsDeviceId = ref("");
+const diagnosticsDevices = ref([]);
+const diagnostics = ref(null);
+const diagnosticsLoading = ref(false);
+const diagnosticsError = ref("");
+let diagnosticsRequest = 0;
+
+function openDiagnostics(friend) {
+  diagnosticsFriend.value = { id: friend.id, uid: friend.uid };
+  diagnosticsTarget.value = "shadowrocket";
+  diagnosticsDeviceId.value = "";
+  diagnosticsDevices.value = [];
+  return refreshDiagnostics();
+}
+
+function closeDiagnostics() {
+  diagnosticsRequest += 1;
+  diagnosticsFriend.value = null;
+  diagnostics.value = null;
+  diagnosticsDevices.value = [];
+  diagnosticsError.value = "";
+  diagnosticsLoading.value = false;
+}
+
+async function refreshDiagnostics() {
+  if (!diagnosticsFriend.value) return;
+  const requestId = ++diagnosticsRequest;
+  diagnostics.value = null;
+  diagnosticsError.value = "";
+  diagnosticsLoading.value = true;
+  try {
+    const result = await api.friendSubscriptionDiagnostics(diagnosticsFriend.value.id, diagnosticsTarget.value, diagnosticsDeviceId.value);
+    if (requestId !== diagnosticsRequest) return;
+    diagnostics.value = result;
+    diagnosticsDevices.value = result.devices || [];
+  } catch (e) {
+    if (requestId !== diagnosticsRequest) return;
+    // Do not display arbitrary response bodies: they may contain sensitive URLs.
+    diagnosticsError.value = e.status === 401 ? "登录已失效，请重新登录后重试。"
+      : e.status === 404 ? "用户或设备记录不存在，或体检接口尚未部署。请重新打开体检或稍后重试。"
+        : "订阅体检加载失败，请重试。";
+  } finally {
+    if (requestId === diagnosticsRequest) diagnosticsLoading.value = false;
+  }
+}
+
+function diagnosticAgentState(state) {
+  return { not_managed: "非托管", unregistered: "未注册", stale: "状态陈旧", online: "在线", error: "错误" }[state] || "未知";
+}
+
+onBeforeUnmount(closeDiagnostics);
 
 function emptyForm() {
   return { uid: "", remark: "", flow_limit_gb: 0, device_limit: 0, per_user_credentials: false, node_ids: [], announcement_ids: [], rotate_token: false, expires_at: "" };
@@ -294,9 +348,56 @@ onMounted(load);
       <div class="table-cell"><strong>{{ realNodeCount(friend) }} 个节点</strong><span>{{ friend.device_count || 0 }}{{ friend.device_limit ? ` / ${friend.device_limit}` : "" }} 台设备</span></div>
       <div class="table-cell table-flow"><strong>{{ formatBytes(friend.flow_used_bytes || 0) }} / {{ friend.flow_limit_bytes ? formatBytes(friend.flow_limit_bytes) : "不限" }}</strong><div v-if="friend.flow_limit_bytes" class="bar table-bar"><i :class="quotaTone(friend)" :style="{ '--meter': `${Math.min(100, Number(friend.flow_percent || 0))}%` }"></i></div></div>
       <div class="table-cell"><strong class="table-state" :class="authState(friend).tone">{{ authState(friend).text }}</strong><span>{{ friend.expires_at ? `到期：${friend.expires_at.slice(0, 10)} · ${expiryText(friend.expires_at)}` : `创建于 ${timeAgo(friend.created_at)}` }}</span><span v-if="friend.last_shared_fallback_nodes || friend.last_skipped_node_count || friend.last_expired_node_count" class="mk is-warn" role="status">最近订阅：{{ friend.last_shared_fallback_nodes || 0 }} 回退 · {{ friend.last_skipped_node_count || 0 }} 未同步 · {{ friend.last_expired_node_count || 0 }} 到期</span></div>
-      <div class="table-actions"><button class="b" :disabled="!friend.links?.clash" @click="copyText(friend.links?.clash, 'Clash 订阅链接')">复制 Clash</button><button class="b" :disabled="!friend.links?.shadowrocket" @click="copyText(friend.links?.shadowrocket, '小火箭订阅链接')">复制小火箭</button><button class="b" :disabled="!friend.links?.v2ray" @click="copyText(friend.links?.v2ray, 'V2Ray 订阅链接')">复制 V2Ray</button><button class="b b-am" @click="openEdit(friend)">查看与编辑</button></div>
+      <div class="table-actions"><button class="b" :disabled="!friend.links?.clash" @click="copyText(friend.links?.clash, 'Clash 订阅链接')">复制 Clash</button><button class="b" :disabled="!friend.links?.shadowrocket" @click="copyText(friend.links?.shadowrocket, '小火箭订阅链接')">复制小火箭</button><button class="b" :disabled="!friend.links?.v2ray" @click="copyText(friend.links?.v2ray, 'V2Ray 订阅链接')">复制 V2Ray</button><button class="b" @click="openDiagnostics(friend)">订阅体检</button><button class="b b-am" @click="openEdit(friend)">查看与编辑</button></div>
     </article>
   </div>
+
+  <Modal v-if="diagnosticsFriend" :title="`订阅体检 · ${diagnosticsFriend.uid}`" @close="closeDiagnostics">
+    <p class="form-hint">只读诊断：不会真实拉取订阅、创建设备、消耗名额或更新拉取记录，也不执行实际网络连通性测试。不展示或复制 Token；选择已有设备记录不代表持有其 Token。</p>
+    <div class="form-row">
+      <label for="diagnostics-target">订阅格式</label>
+      <select id="diagnostics-target" v-model="diagnosticsTarget" @change="refreshDiagnostics">
+        <option value="clash">Clash</option><option value="shadowrocket">Shadowrocket（小火箭）</option><option value="v2ray">V2Ray</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="diagnostics-device">设备场景</label>
+      <select id="diagnostics-device" v-model="diagnosticsDeviceId" @change="refreshDiagnostics">
+        <option value="">假设新设备（不创建设备）</option>
+        <option v-for="device in diagnosticsDevices" :key="device.id" :value="device.id">{{ device.label || `设备 #${device.id}` }} · #{{ device.id }} · {{ device.identity_source }}{{ device.blocked ? ' · 已封禁' : '' }}{{ device.link_revoked ? ' · 链接已撤销' : '' }}</option>
+      </select>
+    </div>
+    <p v-if="diagnosticsLoading" class="form-hint" role="status">正在生成只读诊断…</p>
+    <p v-else-if="diagnosticsError" class="form-error" role="alert">{{ diagnosticsError }}</p>
+    <div v-else-if="diagnostics" aria-live="polite">
+      <p class="form-hint">用户 {{ diagnostics.uid }} · #{{ diagnostics.friend_id }} · {{ diagnostics.target }} · 生成时间 {{ diagnostics.generated_at }}</p>
+      <section class="credential-group">
+        <h3 class="credential-name">账户与设备准入</h3>
+        <div class="credential-main"><strong>账户</strong><span class="mk" :class="diagnostics.account.allowed ? 'ok' : 'bad'">{{ diagnostics.account.allowed ? '允许' : '拒绝' }}</span></div>
+        <p>{{ diagnostics.account.message }} <span class="n faint">（{{ diagnostics.account.code }}）</span></p>
+        <div class="credential-main"><strong>设备 · {{ diagnostics.device.scenario === 'new_device' ? '假设新设备' : `已有记录 #${diagnostics.device.selected_id}` }}</strong><span class="mk" :class="diagnostics.device.allowed ? 'ok' : 'bad'">{{ diagnostics.device.allowed ? '允许' : '拒绝' }}</span></div>
+        <p>{{ diagnostics.device.message }} <span class="n faint">（{{ diagnostics.device.code }}）</span></p>
+        <p class="form-hint">设备数 {{ diagnostics.device.count }} / {{ diagnostics.device.limit === 0 ? '不限' : diagnostics.device.limit }}</p>
+      </section>
+      <section class="credential-group">
+        <h3 class="credential-name">节点资格与订阅预期</h3>
+        <p>预期 HTTP {{ diagnostics.subscription.http_status }} · {{ diagnostics.subscription.code }}</p>
+        <div class="credential-meta"><span>已分配 {{ diagnostics.subscription.assigned_count }}</span><span>符合条件 {{ diagnostics.subscription.eligible_count }}</span><span>预期渲染 {{ diagnostics.subscription.rendered_count }}</span><span>公告 {{ diagnostics.subscription.announcement_count }}</span></div>
+        <p class="form-hint">节点符合条件不等于账户或设备获准拉取；公告不计作可用节点。以下为配置与同步状态判断，不是节点连通性测试。</p>
+      </section>
+      <div class="credential-groups">
+        <section v-for="node in diagnostics.nodes" :key="node.node_id" class="credential-group">
+          <div class="credential-main"><h3 class="credential-name">{{ node.name }} · #{{ node.node_id }}</h3><span class="mk" :class="node.included ? 'ok' : 'warn'">{{ node.included ? '纳入' : '排除' }}</span></div>
+          <p>{{ node.message }} <span class="n faint">（{{ node.code }}）</span></p>
+          <div class="credential-meta"><span>{{ node.protocol }}</span><span>凭据状态：{{ credentialStatus(node.credential_status).text }}</span><span>凭据同步时间：{{ node.credential_synced_at || '尚无同步记录' }}</span></div>
+          <div class="credential-meta"><span>Agent：{{ diagnosticAgentState(node.agent.state) }}</span><span>配置代次：{{ node.agent.generation_matches === true ? '匹配' : node.agent.generation_matches === false ? '不匹配' : '未知 / 不适用' }}</span></div>
+        </section>
+        <div v-if="!diagnostics.nodes.length" class="st"><b>无节点诊断记录</b><span>请结合账户准入与节点计数判断；这不表示网络故障。</span></div>
+      </div>
+      <p v-if="diagnostics.notice" class="form-hint">{{ diagnostics.notice }}</p>
+    </div>
+    <div class="modal-foot"><button class="b" @click="closeDiagnostics">关闭</button><button class="b b-am" :disabled="diagnosticsLoading" @click="refreshDiagnostics">{{ diagnosticsLoading ? '体检中…' : '刷新体检' }}</button></div>
+  </Modal>
 
   <Modal v-if="showForm" :title="editing ? `编辑用户 · ${editing.uid}` : '新建用户'" @close="showForm = false">
     <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>

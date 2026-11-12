@@ -66,6 +66,11 @@ export const api = {
   deleteFriend: (id) => del(`/api/admin/friends/${id}`),
   friendTraffic: (id, range = "24h") => get(`/api/admin/friends/${id}/traffic?range=${range}`),
   friendCredentials: (id) => get(`/api/admin/friends/${id}/credentials`),
+  friendSubscriptionDiagnostics: (id, target = "shadowrocket", deviceId = null) => {
+    const query = new URLSearchParams({ target });
+    if (deviceId !== null && deviceId !== undefined && deviceId !== "") query.set("device_id", deviceId);
+    return get(`/api/admin/friends/${encodeURIComponent(id)}/subscription-diagnostics?${query}`);
+  },
 
   syncCredential: (id) => post(`/api/admin/credentials/${id}/sync`),
   rotateCredential: (id) => post(`/api/admin/credentials/${id}/rotate`),
