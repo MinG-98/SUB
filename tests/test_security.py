@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 import app.main as main_module
 import app.proxy_adapters as proxy_adapters
 from app.agent_api import _desired_users, _mark_applied, _record_traffic
+from app.converter import uri_with_name
 from app.credentials import credential_stats_id, credential_values
 from app.main import Session, app
 from app.models import (
@@ -52,6 +53,194 @@ from app.models import (
     make_session_factory,
     utcnow,
 )
+
+
+@pytest.fixture
+def diagnostics_db(tmp_path):
+    factory = make_session_factory(str(tmp_path / "diagnostics.db"))
+    db = factory()
+    friend = Friend(uid="diagnostics", token="private-user-token", device_limit=1)
+    node = Node(
+        name="fixture",
+        protocol="hysteria2",
+        uri="hysteria2://private-password@node.invalid:443",
+    )
+    db.add_all([friend, node])
+    db.flush()
+    db.add(Allocation(friend_id=friend.id, node_id=node.id))
+    device = Device(
+        friend_id=friend.id, fingerprint="private-fingerprint", fetch_count=7
+    )
+    db.add(device)
+    db.commit()
+    yield db, friend, node, device
+    db.close()
+
+
+def test_subscription_diagnostics_no_mutation_or_secrets(diagnostics_db):
+    import json
+
+    from sqlalchemy import event
+
+    db, friend, node, device = diagnostics_db
+    statements = []
+    connection = db.connection()
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(connection, "before_cursor_execute", capture)
+    try:
+        report = main_module.diagnose_subscription(
+            friend.id, Response(), target="shadowrocket", device_id=None, db=db, _={}
+        )
+    finally:
+        event.remove(connection, "before_cursor_execute", capture)
+    assert statements and all(
+        s.lstrip().upper().startswith("SELECT") for s in statements
+    )
+    assert not db.new and not db.dirty and not db.deleted
+    assert report["subscription"]["http_status"] == 403
+    assert report["device"]["code"] == "device_limit_reached"
+    assert report["subscription"]["rendered_count"] == 1
+    encoded = json.dumps(report)
+    for secret in [friend.token, node.uri, "private-password", device.fingerprint]:
+        assert secret not in encoded
+    assert device.fetch_count == 7
+    assert db.query(FetchLog).count() == 0
+    assert db.query(Device).count() == 1
+
+
+@pytest.mark.parametrize("target", ["clash", "shadowrocket", "v2ray"])
+def test_subscription_diagnostics_matches_delivery(diagnostics_db, target):
+    import json
+
+    db, friend, node, device = diagnostics_db
+    device.device_token_hash = main_module.device_token_hash("private-device-token")
+    device.identity_source = "device_link"
+    db.commit()
+    report = main_module.diagnose_subscription(
+        friend.id, Response(), target=target, device_id=device.id, db=db, _={}
+    )
+    response = main_module.subscription(
+        friend.token,
+        Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)}),
+        target=target,
+        device="private-device-token",
+        db=db,
+    )
+    assert report["subscription"]["http_status"] == response.status_code == 200
+    assert report["subscription"]["rendered_count"] == 1
+    assert "private-device-token" not in json.dumps(report)
+    if target == "clash":
+        assert len(yaml.safe_load(response.body)["proxies"]) == 1
+    else:
+        assert len(base64.b64decode(response.body).decode().splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "state", ["blocked", "revoked", "expired", "disabled", "quota"]
+)
+def test_subscription_diagnostics_reports_admission(diagnostics_db, state):
+    db, friend, _, device = diagnostics_db
+    device.device_token_hash = main_module.device_token_hash("private-device-token")
+    if state == "blocked":
+        device.blocked = True
+    elif state == "revoked":
+        device.device_token_revoked_at = utcnow()
+    elif state == "expired":
+        friend.expires_at = utcnow() - timedelta(days=1)
+    elif state == "disabled":
+        friend.enabled = False
+    else:
+        friend.flow_limit_gb = 1
+        db.add(
+            FlowRecord(
+                friend_id=friend.id,
+                node_id=None,
+                source="hysteria2",
+                bucket=utcnow(),
+                bytes_in=1024**3,
+                bytes_out=0,
+            )
+        )
+    db.commit()
+    report = main_module.diagnose_subscription(
+        friend.id, Response(), target="shadowrocket", device_id=device.id, db=db, _={}
+    )
+    with pytest.raises(HTTPException) as error:
+        main_module.subscription(
+            friend.token,
+            Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)}),
+            target="shadowrocket",
+            device="private-device-token",
+            db=db,
+        )
+    assert report["subscription"]["http_status"] == error.value.status_code
+
+
+def test_subscription_diagnostics_protocol_skip_and_stale_agent(
+    protocol_boundary, monkeypatch
+):
+    db, friend, node, _, current = protocol_boundary
+    monkeypatch.setenv("SUB_APP_PER_USER_CREDENTIALS", "1")
+    db.add(
+        NodeAgent(
+            node_id=node.id,
+            token_hash="not-exposed",
+            status="ready",
+            desired_generation="same",
+            applied_generation="same",
+            last_seen=utcnow() - timedelta(days=1),
+        )
+    )
+    db.delete(current)
+    db.commit()
+    report = main_module.diagnose_subscription(
+        friend.id, Response(), target="shadowrocket", device_id=None, db=db, _={}
+    )
+    assert report["subscription"]["http_status"] == 503
+    assert report["nodes"][0]["code"] == "credential_unavailable"
+    assert report["nodes"][0]["agent"] == {
+        "state": "stale",
+        "generation_matches": False,
+    }
+
+
+def test_subscription_diagnostics_rejects_other_users_device(diagnostics_db):
+    db, friend, _, _ = diagnostics_db
+    other = Friend(uid="other-diagnostics", token="other-private")
+    db.add(other)
+    db.flush()
+    other_device = Device(friend_id=other.id, fingerprint="other-fingerprint")
+    db.add(other_device)
+    db.commit()
+    with pytest.raises(HTTPException) as error:
+        main_module.diagnose_subscription(
+            friend.id,
+            Response(),
+            target="clash",
+            device_id=other_device.id,
+            db=db,
+            _={},
+        )
+    assert error.value.status_code == 404
+
+
+def test_subscription_diagnostics_requires_admin_and_no_store(diagnostics_db):
+    db, friend, _, _ = diagnostics_db
+    client = TestClient(app)
+    endpoint = f"/api/admin/friends/{friend.id}/subscription-diagnostics"
+    assert client.get(endpoint).status_code == 401
+    app.dependency_overrides[main_module.require_admin] = lambda: {}
+    app.dependency_overrides[main_module.get_db] = lambda: db
+    try:
+        result = client.get(endpoint)
+        assert result.status_code == 200
+        assert result.headers["cache-control"] == "private, no-store"
+        assert client.get(endpoint + "?target=unsupported").status_code == 400
+    finally:
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture(params=["vless", "hysteria2"])
@@ -1332,7 +1521,7 @@ def test_subscription_includes_only_assigned_enabled_announcements_in_all_format
         friend_id = friend.id
         expected = [
             main_module._announcement_uri(assigned.name),
-            main_module.uri_with_name(node.uri, node.name),
+            uri_with_name(node.uri, node.name),
         ]
     finally:
         db.close()

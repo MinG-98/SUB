@@ -18,12 +18,11 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from sqlalchemy import delete, func, or_, select
 
 from app.account_policy import is_expired as _is_expired
-from app.converter import parse_uri, render, uri_with_name
+from app.converter import parse_uri, render
 from app.credentials import (
     credential_public_dict,
     ensure_credential,
     per_user_feature_enabled,
-    render_credential_uri,
 )
 from app.latency import read_status, start_probe
 from app.models import (
@@ -61,6 +60,8 @@ from app.proxy_adapters import (
     sync_vless_config,
 )
 from app.quota import flow_limit_reached, friend_usage
+from app.subscription_diagnostics import TARGETS, subscription_diagnostics
+from app.subscription_plan import announcement_uri, build_subscription_plan
 from app.traffic import (
     CollectorError,
     collector_config,
@@ -2139,12 +2140,33 @@ def stats(db=Depends(get_db), _=Depends(require_admin)):
 # ---------------------------------------------------------------- subscription
 
 
+@app.get("/api/admin/friends/{friend_id}/subscription-diagnostics")
+def diagnose_subscription(
+    friend_id: int,
+    response: Response,
+    target: str = "shadowrocket",
+    device_id: int | None = None,
+    db=Depends(get_db),
+    _=Depends(require_admin),
+):
+    response.headers["Cache-Control"] = "private, no-store"
+    friend = db.get(Friend, friend_id)
+    if friend is None:
+        raise HTTPException(404, "用户不存在")
+    target = target.lower()
+    if target not in TARGETS:
+        raise HTTPException(400, "不支持的订阅格式")
+    try:
+        with db.no_autoflush:
+            return subscription_diagnostics(
+                db, friend, target, device_id, per_user_feature_enabled()
+            )
+    except LookupError:
+        raise HTTPException(404, "该用户没有此设备记录")
+
+
 def _announcement_uri(name: str) -> str:
-    fragment = quote(name, safe="")
-    return (
-        "vless://00000000-0000-0000-0000-000000000000"
-        f"@127.0.0.1:1?encryption=none#{fragment}"
-    )
+    return announcement_uri(name)
 
 
 @app.get("/sub/{token}")
@@ -2224,82 +2246,11 @@ def subscription(
     )
     db.add(fetch_log)
 
-    uris = []
-    allocated_nodes = db.scalars(
-        select(Node)
-        .join(Allocation, Allocation.node_id == Node.id)
-        .where(Allocation.friend_id == friend.id, Node.enabled.is_(True))
-        .order_by(Node.sort_order, Node.id)
-    ).all()
-    allocated_nodes = [node for node in allocated_nodes if is_real_node(node)]
-    allocated_announcements = db.scalars(
-        select(Announcement)
-        .join(
-            AnnouncementAllocation,
-            AnnouncementAllocation.announcement_id == Announcement.id,
-        )
-        .where(
-            AnnouncementAllocation.friend_id == friend.id,
-            Announcement.enabled.is_(True),
-        )
-        .order_by(Announcement.sort_order, Announcement.id)
-    ).all()
-    subscription_items = [
-        ((node.sort_order, node.id, 0), "node", node) for node in allocated_nodes
-    ] + [
-        (
-            (
-                announcement.sort_order,
-                announcement.legacy_node_id or announcement.id,
-                1,
-            ),
-            "announcement",
-            announcement,
-        )
-        for announcement in allocated_announcements
-    ]
-    subscription_items.sort(key=lambda row: row[0])
-    skipped_nodes = []
+    plan = build_subscription_plan(db, friend, per_user_feature_enabled())
+    uris = plan.uris
+    skipped_nodes = plan.skipped_nodes
     shared_fallback_nodes = []
-    expired_nodes = []
-    for _sort_key, item_type, item in subscription_items:
-        if item_type == "announcement":
-            uris.append(_announcement_uri(item.name))
-            continue
-        node = item
-        if _is_expired(node.expires_at):
-            expired_nodes.append(node.id)
-            continue
-        use_per_user = (
-            friend.per_user_credentials
-            and per_user_feature_enabled()
-            and adapter_info(node)
-            and node_per_user_enabled(node)
-        )
-        if not use_per_user:
-            uris.append(uri_with_name(node.uri, node.name))
-            continue
-        row = db.scalar(
-            select(UserNodeCredential)
-            .where(
-                UserNodeCredential.friend_id == friend.id,
-                UserNodeCredential.node_id == node.id,
-                UserNodeCredential.protocol == node.protocol,
-                UserNodeCredential.revoked_at.is_(None),
-                UserNodeCredential.status == "active",
-            )
-            .order_by(UserNodeCredential.version.desc())
-            .limit(1)
-        )
-        if row is None:
-            skipped_nodes.append(node.id)
-            continue
-        try:
-            uris.append(render_credential_uri(node, row))
-        except ValueError:
-            # Historical inconsistent metadata must not break healthy nodes or
-            # weaken authentication by falling back to a shared credential.
-            skipped_nodes.append(node.id)
+    expired_nodes = plan.expired_nodes
     fetch_log.shared_fallback_count = len(shared_fallback_nodes)
     fetch_log.skipped_node_count = len(skipped_nodes)
     fetch_log.expired_node_count = len(expired_nodes)

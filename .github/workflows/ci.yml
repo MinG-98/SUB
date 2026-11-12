@@ -55,6 +55,7 @@ jobs:
           test -s "$release_dir/static/index.html"
           test -s "$release_dir/static/favicon.svg"
           test ! -e "$release_dir/frontend/node_modules"
+          python scripts/verify_release.py --release-dir "$release_dir"
 
       - name: Upload non-deployed release candidate
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
