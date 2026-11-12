@@ -157,12 +157,18 @@ async function saveDetail() {
 }
 
 async function rotateLink() {
-  if (!detail.value || !window.confirm("确定轮换该设备链接？旧链接会立即失效。")) return;
+  if (!detail.value) return;
+  const converting = detail.value.identity_source !== "device_link";
+  const message = converting
+    ? "将这条访问记录转为设备专属链接？保留原名额和历史，不增加设备数。请将新链接导入对应客户端；普通订阅链接不会自动升级。"
+    : "确定轮换该设备链接？旧的设备专属链接会立即失效。";
+  if (!window.confirm(message)) return;
   detailBusy.value = true;
   try {
     const result = await api.rotateDeviceLink(detail.value.id);
     detailLinks.value = result.links;
-    pushToast("链接已轮换", "success");
+    detail.value = { ...detail.value, ...result.device };
+    pushToast(converting ? "已转换，请将专属链接导入客户端" : "链接已轮换", "success");
     await load();
   } catch (e) {
     pushToast(e.message || "轮换失败");
@@ -249,8 +255,9 @@ onMounted(load);
   <Modal v-if="showCreate" title="创建设备专属订阅链接" @close="showCreate = false">
     <template v-if="createdLinks">
       <p class="form-hint">链接只在本次显示一次，数据库仅保存不可逆哈希。请现在复制给对应设备。</p>
-      <div class="link-box"><code>{{ createdLinks.clash }}</code><button class="b" @click="copyText(createdLinks.clash, 'Clash 链接')">复制</button></div>
-      <div class="link-box"><code>{{ createdLinks.v2ray }}</code><button class="b" @click="copyText(createdLinks.v2ray, 'V2Ray 链接')">复制</button></div>
+      <div class="link-box"><code>{{ createdLinks.clash }}</code><button class="b" @click="copyText(createdLinks.clash, 'Clash 链接')">复制 Clash</button></div>
+      <div class="link-box"><code>{{ createdLinks.shadowrocket }}</code><button class="b" @click="copyText(createdLinks.shadowrocket, '小火箭链接')">复制小火箭</button></div>
+      <div class="link-box"><code>{{ createdLinks.v2ray }}</code><button class="b" @click="copyText(createdLinks.v2ray, 'V2Ray 链接')">复制 V2Ray</button></div>
       <div class="modal-foot"><button class="b b-am" @click="showCreate = false">完成</button></div>
     </template>
     <template v-else>
@@ -263,9 +270,10 @@ onMounted(load);
 
   <Modal v-if="detail" :title="detail.label || `设备 #${detail.id}`" @close="detail = null">
     <template v-if="detailLinks">
-      <p class="form-hint">新链接只在本次显示一次，旧链接已经失效。</p>
-      <div class="link-box"><code>{{ detailLinks.clash }}</code><button class="b" @click="copyText(detailLinks.clash, 'Clash 链接')">复制</button></div>
-      <div class="link-box"><code>{{ detailLinks.v2ray }}</code><button class="b" @click="copyText(detailLinks.v2ray, 'V2Ray 链接')">复制</button></div>
+      <p class="form-hint">专属链接只显示一次，请复制并导入客户端。使用它换网络不会新增名额；普通订阅链接不会自动变成专属链接。若此前有设备专属链接，旧的已失效。链接可被转发，不代表硬件身份。</p>
+      <div class="link-box"><code>{{ detailLinks.clash }}</code><button class="b" @click="copyText(detailLinks.clash, 'Clash 链接')">复制 Clash</button></div>
+      <div class="link-box"><code>{{ detailLinks.shadowrocket }}</code><button class="b" @click="copyText(detailLinks.shadowrocket, '小火箭链接')">复制小火箭</button></div>
+      <div class="link-box"><code>{{ detailLinks.v2ray }}</code><button class="b" @click="copyText(detailLinks.v2ray, 'V2Ray 链接')">复制 V2Ray</button></div>
       <div class="modal-foot"><button class="b b-am" @click="detail = null">完成</button></div>
     </template>
     <template v-else>
@@ -281,7 +289,7 @@ onMounted(load);
       <div class="form-row"><label for="detail-label">设备备注</label><input id="detail-label" v-model="detailForm.label" placeholder="未命名"></div>
       <div class="check"><input id="detail-blocked" v-model="detailForm.blocked" type="checkbox"><label for="detail-blocked">封锁该访问记录</label></div>
       <div class="modal-foot between">
-        <div class="modal-foot-group"><button v-if="detail.identity_source === 'device_link'" class="b" :disabled="detailBusy" @click="rotateLink">轮换链接</button><button v-if="detail.device_link_active" class="b b-bad" :disabled="detailBusy" @click="revokeLink">撤销链接</button><button class="b b-bad" :disabled="detailBusy" @click="removeDevice">删除设备</button></div>
+        <div class="modal-foot-group"><button class="b" :disabled="detailBusy" @click="rotateLink">{{ detail.identity_source === 'device_link' ? '轮换链接' : '原名额转专属链接' }}</button><button v-if="detail.device_link_active" class="b b-bad" :disabled="detailBusy" @click="revokeLink">撤销链接</button><button class="b b-bad" :disabled="detailBusy" @click="removeDevice">删除设备</button></div>
         <div class="modal-foot-group"><button class="b" @click="detail = null">取消</button><button class="b b-am" :disabled="detailBusy" @click="saveDetail">{{ detailBusy ? "保存中…" : "保存" }}</button></div>
       </div>
     </template>

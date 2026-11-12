@@ -24,6 +24,7 @@ os.environ["SUB_APP_DB"] = str(_TEST_ROOT / "app.db")
 os.environ["SUB_APP_PROXY_STATUS"] = str(_TEST_ROOT / "proxy-status.json")
 os.environ["SUB_APP_RECONCILER_STATUS"] = str(_TEST_ROOT / "reconciler-status.json")
 
+import pytest
 import yaml
 from fastapi import HTTPException, Request, Response
 from fastapi.testclient import TestClient
@@ -51,6 +52,275 @@ from app.models import (
     make_session_factory,
     utcnow,
 )
+
+
+@pytest.fixture(params=["vless", "hysteria2"])
+def protocol_boundary(request, tmp_path):
+    db = make_session_factory(str(tmp_path / "protocol.db"))()
+    protocol = request.param
+    other = "hysteria2" if protocol == "vless" else "vless"
+    friend = Friend(
+        uid="protocol-boundary", token="fixture-token", per_user_credentials=True
+    )
+    node = Node(
+        name="fixture",
+        protocol=protocol,
+        uri=f"{protocol}://fixture@node.invalid:443",
+        adapter_kind="remote_agent",
+        per_user_enabled=True,
+    )
+    db.add_all([friend, node])
+    db.flush()
+    db.add(Allocation(friend_id=friend.id, node_id=node.id))
+    stale = UserNodeCredential(
+        friend_id=friend.id,
+        node_id=node.id,
+        protocol=other,
+        credential_name="fixture-old",
+        version=99,
+        status="active",
+    )
+    current = UserNodeCredential(
+        friend_id=friend.id,
+        node_id=node.id,
+        protocol=protocol,
+        credential_name="fixture-current",
+        version=1,
+        status="active",
+    )
+    db.add_all([stale, current])
+    db.commit()
+    yield db, friend, node, stale, current
+    db.close()
+
+
+def test_protocol_boundary_rejects_switch_without_mutating_node(protocol_boundary):
+    db, _, node, stale, _ = protocol_boundary
+    original = node.uri
+    with pytest.raises(HTTPException) as error:
+        main_module.update_node(
+            node.id,
+            {
+                "uri": f"{stale.protocol}://fixture@other.invalid:443",
+                "name": "must-not-save",
+            },
+            db=db,
+            _={},
+        )
+    assert error.value.status_code == 409
+    db.refresh(node)
+    assert node.uri == original and node.name == "fixture"
+    result = main_module.update_node(node.id, {"name": "safe rename"}, db=db, _={})
+    assert result["name"] == "safe rename"
+
+
+def test_protocol_boundary_filters_subscription_and_desired(
+    protocol_boundary, monkeypatch
+):
+    from app.converter import parse_uri
+    from app.credentials import render_credential_uri
+
+    db, friend, node, stale, current = protocol_boundary
+    monkeypatch.setenv("SUB_APP_PER_USER_CREDENTIALS", "1")
+    request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)})
+    response = main_module.subscription(
+        friend.token, request, target="shadowrocket", device=None, db=db
+    )
+    uri = base64.b64decode(response.body).decode()
+    assert uri == render_credential_uri(node, current)
+    assert parse_uri(uri)["scheme"] == node.protocol
+    assert [item["credential_id"] for item in _desired_users(db, node.id)] == [
+        current.id
+    ]
+    with pytest.raises(ValueError):
+        render_credential_uri(node, stale)
+    db.delete(current)
+    db.commit()
+    with pytest.raises(HTTPException) as error:
+        main_module.subscription(
+            friend.token, request, target="shadowrocket", device=None, db=db
+        )
+    assert error.value.status_code == 503
+
+
+def test_protocol_boundary_blocks_stale_activation_and_rotation(protocol_boundary):
+    db, _, node, stale, current = protocol_boundary
+    result = proxy_adapters.activate_credential(db, stale)
+    assert result.status == "error" and result.last_synced_at is None
+    with pytest.raises(HTTPException) as error:
+        main_module.rotate_credential(stale.id, db=db, _={})
+    assert error.value.status_code == 409
+    current.status = "pending"
+    assert _mark_applied(db, node.id, "fixture-generation", "fixture-generation") == 1
+    assert current.status == "active" and stale.status == "error"
+
+
+def test_device_slot_conversion_preserves_history_and_survives_network_changes(
+    protocol_boundary, monkeypatch
+):
+    db, friend, node, _, _ = protocol_boundary
+    monkeypatch.setenv("SUB_APP_PER_USER_CREDENTIALS", "1")
+    friend.device_limit = 1
+
+    def request(ip, ua):
+        return Request(
+            {
+                "type": "http",
+                "scheme": "https",
+                "path": "/",
+                "query_string": b"",
+                "server": ("testserver", 443),
+                "headers": [(b"user-agent", ua.encode())],
+                "client": (ip, 1),
+            }
+        )
+
+    first = request("192.0.2.1", "fixture-client-one")
+    main_module.subscription(
+        friend.token, first, target="shadowrocket", device=None, db=db
+    )
+    original = db.query(Device).filter_by(friend_id=friend.id).one()
+    device_id, first_seen = original.id, original.first_seen
+    with pytest.raises(HTTPException) as error:
+        main_module.subscription(
+            friend.token,
+            request("192.0.2.2", "fixture-client-two"),
+            target="shadowrocket",
+            device=None,
+            db=db,
+        )
+    assert error.value.status_code == 403
+    converted = main_module.rotate_device_link(device_id, first, db=db, _={})
+    token = parse_qs(urlsplit(converted["links"]["shadowrocket"]).query)["device"][0]
+    for i in range(3):
+        response = main_module.subscription(
+            friend.token,
+            request(f"192.0.2.{i + 10}", f"fixture-client-{i}"),
+            target="shadowrocket",
+            device=token,
+            db=db,
+        )
+        assert response.status_code == 200
+    db.refresh(original)
+    assert original.id == device_id and original.first_seen == first_seen
+    assert original.fetch_count == 4 and original.identity_source == "device_link"
+    assert db.query(Device).filter_by(friend_id=friend.id).count() == 1
+    assert db.query(FetchLog).filter_by(device_id=device_id).count() == 4
+    original.blocked = True
+    db.commit()
+    main_module.rotate_device_link(device_id, first, db=db, _={})
+    assert original.blocked is True
+
+
+def test_protocol_boundary_rejects_revoked_history_and_allows_alias_edits(
+    protocol_boundary,
+):
+    db, _, node, stale, current = protocol_boundary
+    for row in (stale, current):
+        row.revoked_at = utcnow()
+        row.status = "revoked"
+    db.commit()
+    with pytest.raises(HTTPException) as error:
+        main_module.update_node(
+            node.id,
+            {"uri": f"{stale.protocol}://fixture@node.invalid:443"},
+            db=db,
+            _={},
+        )
+    assert error.value.status_code == 409
+    scheme = "HY2" if node.protocol == "hysteria2" else "VLESS"
+    result = main_module.update_node(
+        node.id, {"uri": f"{scheme}://fixture@replacement.invalid:8443"}, db=db, _={}
+    )
+    assert result["protocol"] == current.protocol
+    assert node.server == "replacement.invalid"
+
+
+def test_protocol_boundary_agent_only_and_unmanaged_controls(protocol_boundary):
+    db, _, node, stale, current = protocol_boundary
+    db.delete(stale)
+    db.delete(current)
+    db.commit()
+    replacement = "hysteria2" if node.protocol == "vless" else "vless"
+    payload = {"uri": f"{replacement}://fixture@node.invalid:443"}
+    registration = NodeAgent(
+        node_id=node.id, token_hash="fixture-hash", status="offline"
+    )
+    db.add(registration)
+    db.commit()
+    with pytest.raises(HTTPException) as error:
+        main_module.update_node(node.id, payload, db=db, _={})
+    assert error.value.status_code == 409
+    db.delete(registration)
+    db.commit()
+    assert (
+        main_module.update_node(node.id, payload, db=db, _={})["protocol"]
+        == replacement
+    )
+
+
+def test_protocol_boundary_render_identity_and_uri_guards(protocol_boundary):
+    from app.credentials import render_credential_uri
+
+    db, _, node, stale, current = protocol_boundary
+    original_id = current.node_id
+    current.node_id = original_id + 100
+    with pytest.raises(ValueError):
+        render_credential_uri(node, current)
+    current.node_id = original_id
+    node.uri = f"{stale.protocol}://fixture@node.invalid:443"
+    with pytest.raises(ValueError):
+        render_credential_uri(node, current)
+    db.rollback()
+
+
+def test_protocol_boundary_inconsistent_uri_is_skipped_not_server_error(
+    protocol_boundary, monkeypatch
+):
+    db, friend, node, stale, _ = protocol_boundary
+    monkeypatch.setenv("SUB_APP_PER_USER_CREDENTIALS", "1")
+    node.uri = f"{stale.protocol}://fixture@node.invalid:443"
+    db.commit()
+    request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)})
+    with pytest.raises(HTTPException) as error:
+        main_module.subscription(
+            friend.token, request, target="shadowrocket", device=None, db=db
+        )
+    assert error.value.status_code == 503
+
+
+def test_protocol_boundary_local_extra_cannot_cross_node_or_protocol(protocol_boundary):
+    from types import SimpleNamespace
+
+    db, friend, node, stale, current = protocol_boundary
+    if node.protocol != "vless":
+        assert proxy_adapters._live_vless_rows(db, node.id, extra=stale) == []
+        return
+    assert stale not in proxy_adapters._live_vless_rows(db, node.id, extra=stale)
+    foreign = SimpleNamespace(
+        node_id=node.id + 100, protocol="vless", revoked_at=None, friend=friend
+    )
+    rows = proxy_adapters._live_vless_rows(db, node.id, extra=foreign)
+    assert foreign not in rows and current in rows
+
+
+def test_protocol_boundary_traffic_drops_stale_rows(protocol_boundary):
+    db, friend, node, stale, current = protocol_boundary
+    sample = {
+        "credential_key": credential_stats_id(stale),
+        "sample_key": "fixture-stale-sample",
+        "source": node.protocol,
+        "bytes_in": 12,
+        "bytes_out": 34,
+    }
+    inserted, ack = _record_traffic(db, node.id, [sample])
+    assert inserted == 0 and ack == [sample["sample_key"]]
+    sample.update(
+        credential_key=credential_stats_id(current), sample_key="fixture-current-sample"
+    )
+    assert _record_traffic(db, node.id, [sample])[0] == 1
+    assert db.query(FlowRecord).one().friend_id == friend.id
+
 
 client = TestClient(app, base_url="https://testserver")
 

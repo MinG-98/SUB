@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from sqlalchemy import select
 
-from app.converter import uri_with_name
+from app.converter import parse_uri, uri_with_name
 from app.models import Friend, Node, UserNodeCredential, utc_iso, utcnow
 
 
@@ -97,6 +97,14 @@ def _host_port(parts):
 
 
 def render_credential_uri(node: Node, row: UserNodeCredential) -> str:
+    parsed = parse_uri(node.uri)
+    if (
+        row.protocol != node.protocol
+        or (node.id is not None and row.node_id != node.id)
+        or not parsed
+        or parsed["scheme"] != node.protocol
+    ):
+        raise ValueError("credential and node protocol/identity mismatch")
     values = credential_values(row)
     parts = urlsplit(node.uri)
     host_port = _host_port(parts)

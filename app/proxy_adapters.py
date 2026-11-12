@@ -294,7 +294,12 @@ def _apply_vless_sync(payload: dict) -> dict:
 
 def _live_vless_rows(db, node_id: int, extra: UserNodeCredential | None = None):
     node = db.get(Node, node_id)
-    if node is None or not node.enabled or is_expired(node.expires_at):
+    if (
+        node is None
+        or node.protocol != "vless"
+        or not node.enabled
+        or is_expired(node.expires_at)
+    ):
         return []
     rows = db.scalars(
         select(UserNodeCredential, Friend)
@@ -328,6 +333,8 @@ def _live_vless_rows(db, node_id: int, extra: UserNodeCredential | None = None):
             result.append(row)
     if (
         extra is not None
+        and extra.node_id == node_id
+        and extra.protocol == "vless"
         and extra not in result
         and extra.revoked_at is None
         and extra.friend.enabled
@@ -379,6 +386,11 @@ def activate_credential(db, row: UserNodeCredential) -> UserNodeCredential:
     if node is None:
         row.status = "error"
         row.last_error = "凭据关联的节点不存在"
+        row.last_synced_at = None
+        return row
+    if row.protocol != node.protocol:
+        row.status = "error"
+        row.last_error = "凭据协议与节点不一致，拒绝同步"
         row.last_synced_at = None
         return row
     if is_remote_agent(node):

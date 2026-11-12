@@ -30,7 +30,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 MAX_PENDING_TRAFFIC_RECORDS = 2048
 MAX_TRAFFIC_BATCH_RECORDS = 128
 
@@ -366,11 +366,52 @@ class Agent:
         with opener.open(request, timeout=12) as response:
             return json.loads(response.read(1024 * 1024).decode("utf-8"))
 
+    @staticmethod
+    def validate_desired_users(desired: dict, protocol: str) -> None:
+        """Validate the whole batch before config, state, or auth-cache changes.
+
+        Older valid payloads may omit protocol tags, but never credential fields.
+        Explicit tags must match the consumer; no empty userpass fallback.
+        """
+        if not isinstance(desired, dict) or protocol not in {"vless", "hysteria2"}:
+            raise ValueError("invalid desired protocol")
+        if desired.get("protocol", protocol) != protocol:
+            raise ValueError("mismatched desired protocol")
+        mode = desired.get("mode", "per_user")
+        users = desired.get("users", [])
+        if mode not in {"per_user", "shared", "disabled"} or not isinstance(
+            users, list
+        ):
+            raise ValueError("invalid desired mode/users")
+        if mode == "disabled":
+            if users:
+                raise ValueError("disabled desired state contains users")
+            return
+        for item in users:
+            if not isinstance(item, dict) or item.get("protocol", protocol) != protocol:
+                raise ValueError("invalid desired user protocol")
+            fields = (
+                ["stats_id", "uuid"]
+                if protocol == "vless"
+                else ["stats_id", "username", "password"]
+            )
+            if protocol == "hysteria2" and mode == "shared" and item.get("auth"):
+                fields = ["stats_id", "auth"]
+            if any(
+                not isinstance(item.get(key), str) or not item[key].strip()
+                for key in fields
+            ):
+                raise ValueError("invalid desired user credentials")
+
     def authenticate(self, node_id: int, auth: str) -> dict:
         with self.lock:
             desired = self.desired.get(node_id, {})
             mode = desired.get("mode", "per_user")
             if mode == "disabled" or desired.get("enabled") is False:
+                return {"ok": False}
+            try:
+                self.validate_desired_users(desired, "hysteria2")
+            except ValueError:
                 return {"ok": False}
             users = desired.get("users", [])
             state = self.node_state(node_id)
@@ -462,6 +503,7 @@ class Agent:
         self._service_restart(spec)
 
     def apply_hysteria(self, spec: dict, desired: dict) -> None:
+        self.validate_desired_users(desired, "hysteria2")
         try:
             import yaml  # type: ignore
         except Exception as exc:
@@ -552,6 +594,7 @@ class Agent:
         backend, sing-box matches the client's auth string against each user's
         `password` field directly.
         """
+        self.validate_desired_users(desired, "hysteria2")
         binary = str(spec.get("sing_box_binary", "sing-box"))
         path = self._config_path(
             spec, "sing_box_config", ["/etc/sing-box*/config.json"]
@@ -598,7 +641,14 @@ class Agent:
                 and state.get("legacy_until")
                 and utcnow() < datetime.fromisoformat(state["legacy_until"])
             ):
-                users.extend(state.get("legacy_users", []))
+                users.extend(
+                    item
+                    for item in state.get("legacy_users", [])
+                    if not (
+                        re.fullmatch(r"f\d+n\d+v\d+", str(item.get("name", "")))
+                        and item.get("password") == ":"
+                    )
+                )
             if mode != "disabled":
                 for item in desired.get("users", []):
                     # Subscriptions render hysteria2://user:pass@host and clients
@@ -654,6 +704,7 @@ class Agent:
         return flow or str(spec.get("vless_flow", "") or "")
 
     def apply_vless(self, spec: dict, desired: dict) -> None:
+        self.validate_desired_users(desired, "vless")
         binary = str(spec.get("sing_box_binary", "sing-box"))
         path = self._config_path(
             spec, "sing_box_config", ["/etc/sing-box*/config.json"]
@@ -733,6 +784,7 @@ class Agent:
 
     def apply_xray(self, spec: dict, desired: dict) -> None:
         """Adopt an explicitly selected native Xray Reality inbound (not sing-box)."""
+        self.validate_desired_users(desired, "vless")
         path = Path(spec["xray_config"])
         binary = str(spec.get("xray_binary", "xray"))
         tag, port = spec.get("inbound_tag"), spec.get("inbound_port")
@@ -1078,6 +1130,9 @@ class Agent:
         try:
             desired = self.request_json(
                 "GET", f"/api/agent/v1/desired/{node_id}", token
+            )
+            self.validate_desired_users(
+                desired, spec.get("protocol", desired.get("protocol"))
             )
             with self.lock:
                 self.desired[node_id] = desired
