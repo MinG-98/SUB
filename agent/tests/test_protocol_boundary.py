@@ -1,6 +1,7 @@
 """Reject mixed-protocol desired state before touching proxy config or Agent state."""
 
 import importlib.util
+import json
 import threading
 from pathlib import Path
 
@@ -102,3 +103,43 @@ def test_valid_legacy_field_shapes_remain_supported(protocol, user, mode):
     agent_mod.Agent.validate_desired_users(
         {"mode": mode, "users": [{"stats_id": "fixture", **user}]}, protocol
     )
+
+
+def test_explicit_empty_hy2_legacy_is_not_recaptured_during_adoption(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "hy2.json"
+    path.write_text(
+        json.dumps(
+            {
+                "auth": {
+                    "type": "userpass",
+                    "userpass": {"managed": "private-test-password"},
+                }
+            }
+        )
+    )
+    spec = {
+        "node_id": 6,
+        "protocol": "hysteria2",
+        "hysteria_config": str(path),
+        "auth_port": 19281,
+        "stats_port": 19282,
+        "backup_dir": str(tmp_path / "backups"),
+    }
+    config = {
+        "endpoint": "https://control.invalid",
+        "state_path": str(tmp_path / "state.json"),
+        "nodes": [spec],
+    }
+    agent = agent_mod.Agent(config)
+    agent.state = {
+        "nodes": {"6": {"legacy_auth": [], "legacy_until": "2099-01-01T00:00:00+00:00"}}
+    }
+    monkeypatch.setattr(agent_mod.Agent, "_service_restart", lambda *_: True)
+    desired = {"protocol": "hysteria2", "mode": "per_user", "users": []}
+    agent.apply_hysteria(spec, desired)
+    reloaded = agent_mod.Agent(config)
+    reloaded.desired[6] = desired
+    assert reloaded.node_state(6)["legacy_auth"] == []
+    assert reloaded.authenticate(6, "managed:private-test-password") == {"ok": False}

@@ -211,6 +211,30 @@ def test_non_vless_desired_credential_is_never_authorized(node):
         _assert_clients(node.read(), ALICE, legacy=True)
 
 
+def test_adopted_flow_survives_empty_legacy_reload_and_expiry(node):
+    original = node.read()
+    original["inbounds"][0]["settings"]["clients"] = [
+        {"id": ALICE["uuid"], "email": ALICE["stats_id"], "flow": "xtls-rprx-vision"}
+    ]
+    node.write(original)
+    node.agent.state = {
+        "nodes": {
+            "17": {
+                "xray_legacy": [],
+                "xray_legacy_until": 1,
+                "xray_flow": "xtls-rprx-vision",
+            }
+        }
+    }
+    node.apply(ALICE)
+    node.agent = agent_mod.Agent(node.agent_config)
+    node.apply(BOB)
+    clients = _clients(node.read())
+    assert clients == [
+        {"id": BOB["uuid"], "email": BOB["stats_id"], "flow": "xtls-rprx-vision"}
+    ]
+
+
 def _validation_path(node, argv):
     binary, *options = map(str, argv)
     assert binary == node.spec["xray_binary"]
