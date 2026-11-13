@@ -61,6 +61,10 @@ loopback engine/client test: candidate HTTP auth, real TLS/QUIC handshake,
 allowed and rejected credentials, and an actual proxy request. A rendered YAML
 file is not proof of a working Hy2 server. Inspect staged transport/TLS/listener
 settings and compare all unrelated fields with the originals.
+Keep the original filename suffix during both staging and activation: native
+Hysteria uses the suffix to select JSON or YAML parsing. Agent 0.5.3 preserves
+JSON serialization for `.json` configurations; a YAML-only smoke test cannot
+validate a JSON production configuration.
 
 ## Activation and rollback gates
 
