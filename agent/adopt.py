@@ -10,6 +10,7 @@ the authenticated control plane, not a caller-supplied desired-state file.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -17,6 +18,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -307,13 +309,83 @@ def prepare_state(path, state, legacy_service):
         os.close(directory)
 
 
+def merge_agent_state(existing, addition):
+    """Add newly adopted nodes without discarding active outboxes/counters."""
+    if (
+        not isinstance(existing, dict)
+        or not isinstance(existing.get("nodes"), dict)
+        or not isinstance(addition, dict)
+        or not isinstance(addition.get("nodes"), dict)
+    ):
+        raise AdoptionError("existing Agent state has an unsupported schema")
+    overlap = set(existing["nodes"]) & set(addition["nodes"])
+    if overlap:
+        raise AdoptionError("adoption state would overwrite an existing node")
+    merged = copy.deepcopy(existing)
+    merged["nodes"].update(copy.deepcopy(addition["nodes"]))
+    return merged
+
+
+def merge_existing_state(path, addition, legacy_service, expected_sha256):
+    """Atomically merge after both review-time hash and stopped-service checks."""
+    if os.geteuid() != 0:
+        raise AdoptionError("state preparation requires root")
+    require_stopped(legacy_service)
+    path = Path(path)
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or any(p.is_symlink() for p in path.parents)
+    ):
+        raise AdoptionError("existing state path must be absolute without symlinks")
+    before = snapshot(path)
+    info = path.stat()
+    if (
+        info.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(info.st_mode) & 0o077
+        or info.st_nlink != 1
+    ):
+        raise AdoptionError("existing state ownership or permissions are unsafe")
+    if digest(before) != expected_sha256:
+        raise AdoptionError("existing Agent state changed after plan review")
+    try:
+        existing = json.loads(before)
+    except ValueError as exc:
+        raise AdoptionError("existing Agent state is invalid JSON") from exc
+    merged = merge_agent_state(existing, addition)
+    encoded_state = encoded(merged) + b"\n"
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(encoded_state)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, stat.S_IMODE(info.st_mode))
+        os.chown(temporary, info.st_uid, info.st_gid)
+        require_stopped(legacy_service)
+        current = snapshot(path)
+        if digest(current) != expected_sha256:
+            raise AdoptionError("existing Agent state changed during merge")
+        os.replace(temporary, path)
+        parent_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument(
         "--agent-source", type=Path, default=Path(__file__).with_name("node-agent.py")
     )
-    parser.add_argument("--prepare-state", action="store_true")
+    state_action = parser.add_mutually_exclusive_group()
+    state_action.add_argument("--prepare-state", action="store_true")
+    state_action.add_argument("--merge-state", action="store_true")
     parser.add_argument("--expected-plan")
     args = parser.parse_args(argv)
     try:
@@ -325,8 +397,24 @@ def main(argv=None):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         config = manifest["agent_config"]
-        if args.prepare_state:
+        existing_state_sha256 = None
+        if args.prepare_state or args.merge_state:
             require_stopped(manifest["legacy_service"])
+        if args.merge_state:
+            state_path = Path(config["state_path"])
+            existing_state = snapshot(state_path)
+            if (
+                state_path.stat().st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(state_path.stat().st_mode) & 0o077
+            ):
+                raise AdoptionError(
+                    "existing state ownership or permissions are unsafe"
+                )
+            try:
+                merge_agent_state(json.loads(existing_state), {"nodes": {}})
+            except ValueError as exc:
+                raise AdoptionError("existing Agent state is invalid JSON") from exc
+            existing_state_sha256 = digest(existing_state)
         client = module.Agent(config)
         desired = {
             n["node_id"]: client.request_json(
@@ -336,17 +424,32 @@ def main(argv=None):
         }
         state, report, files = build_plan(manifest, module, desired)
         report["plan_sha256"] = digest(
-            encoded({"plan": report["plan_sha256"], "agent_sha256": digest(source)})
+            encoded(
+                {
+                    "plan": report["plan_sha256"],
+                    "agent_sha256": digest(source),
+                    "existing_state_sha256": existing_state_sha256,
+                }
+            )
         )
-        if args.prepare_state:
+        if args.prepare_state or args.merge_state:
             if not args.expected_plan or args.expected_plan != report["plan_sha256"]:
                 raise AdoptionError(
                     "plan changed or confirmation missing; inspect a fresh plan"
                 )
             if any(digest(snapshot(p)) != value for p, value in files.items()):
                 raise AdoptionError("proxy config changed during validation")
-            prepare_state(config["state_path"], state, manifest["legacy_service"])
+            if args.merge_state:
+                merge_existing_state(
+                    config["state_path"],
+                    state,
+                    manifest["legacy_service"],
+                    existing_state_sha256,
+                )
+            else:
+                prepare_state(config["state_path"], state, manifest["legacy_service"])
         report["state_prepared"] = args.prepare_state
+        report["state_merged"] = args.merge_state
         print(json.dumps(report, sort_keys=True))
         return 0
     except Exception as exc:

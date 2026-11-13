@@ -1,8 +1,8 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api } from "../api.js";
 import { formatBytes, timeAgo } from "../format.js";
-import { pushToast } from "../store.js";
+import { dataRefreshVersion, pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
 import { isRealNode } from "../noc/data.js";
 
@@ -307,6 +307,7 @@ async function credentialAction(row, action) {
   }
 }
 
+watch(dataRefreshVersion, () => load());
 onMounted(load);
 </script>
 

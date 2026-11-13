@@ -1,8 +1,8 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { api } from "../api.js";
 import { timeAgo } from "../format.js";
-import { pushToast } from "../store.js";
+import { dataRefreshVersion, pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
 
 const ATTENTION_THRESHOLD = 500;
@@ -207,6 +207,7 @@ async function removeDevice() {
   }
 }
 
+watch(dataRefreshVersion, () => load());
 onMounted(load);
 </script>
 

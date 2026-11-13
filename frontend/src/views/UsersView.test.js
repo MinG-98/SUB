@@ -26,7 +26,7 @@ function setupDiagnostics() {
   const scopedRequire = (id) => {
     if (id === "vue") return { ...vue, onMounted() {}, onBeforeUnmount(fn) { unmount = fn; } };
     if (id === "../api.js") return { api: mockApi };
-    if (id === "../store.js") return { pushToast() {} };
+    if (id === "../store.js") return { pushToast() {}, dataRefreshVersion: vue.ref(0) };
     if (id.endsWith(".vue")) return { default: {} };
     return require(id);
   };

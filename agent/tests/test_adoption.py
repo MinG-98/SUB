@@ -530,3 +530,110 @@ def test_prepare_state_writes_private_mode_600_with_stopped_service(case, monkey
     assert json.loads(path.read_bytes()) == state
     assert path.read_bytes() == canonical(state) + b"\n"
     assert {node: p.read_bytes() for node, p in case.paths.items()} == config_bytes
+
+
+def test_state_merge_preserves_existing_node_counters_and_outbox():
+    original = {
+        "nodes": {
+            "6": {
+                "counters": {"f18n6v1": {"rx": 100, "tx": 250}},
+                "pending_traffic": [{"sample_key": "pending"}],
+            }
+        }
+    }
+    addition = {"nodes": {"5": {"xray_legacy": [], "xray_flow": FLOW}}}
+    merged = adopt.merge_agent_state(original, addition)
+    assert merged["nodes"]["6"] == original["nodes"]["6"]
+    assert merged["nodes"]["5"] == addition["nodes"]["5"]
+    assert original["nodes"].keys() == {"6"}
+
+
+def test_state_merge_refuses_overlap_instead_of_resetting_a_live_node():
+    with pytest.raises(adopt.AdoptionError, match="overwrite"):
+        adopt.merge_agent_state(
+            {"nodes": {"6": {"pending_traffic": [{"sample_key": "keep"}]}}},
+            {"nodes": {"6": {"counters": {}}}},
+        )
+
+
+def test_state_merge_refuses_unknown_existing_schema():
+    with pytest.raises(adopt.AdoptionError, match="schema"):
+        adopt.merge_agent_state({"generations": {}}, {"nodes": {"5": {}}})
+
+
+def test_existing_state_merge_is_atomic_private_and_bound_to_reviewed_hash(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path.resolve() / "agent-state"
+    parent.mkdir(mode=0o700)
+    path = parent / "state.json"
+    existing = {
+        "nodes": {
+            "6": {
+                "counters": {"f18n6v1": {"rx": 500, "tx": 700}},
+                "pending_traffic": [{"sample_key": "not-acked"}],
+            }
+        }
+    }
+    path.write_bytes(canonical(existing) + b"\n")
+    path.chmod(0o600)
+    previous = path.read_bytes()
+    monkeypatch.setattr(adopt.os, "geteuid", lambda: 0)
+    original_stat = Path.stat
+
+    def root_owned(candidate, *args, **kwargs):
+        result = original_stat(candidate, *args, **kwargs)
+        if candidate == path:
+            fields = list(result)
+            fields[4] = 0
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, "stat", root_owned)
+    monkeypatch.setattr(adopt.os, "chown", lambda *_: None)
+    checked = mock_service(monkeypatch)
+    adopt.merge_existing_state(
+        path,
+        {"nodes": {"5": {"xray_legacy": [], "xray_flow": FLOW}}},
+        SERVICE,
+        sha256(previous),
+    )
+    assert checked.call_count == 2
+    merged = json.loads(path.read_bytes())
+    assert merged["nodes"]["6"] == existing["nodes"]["6"]
+    assert merged["nodes"]["5"]["xray_legacy"] == []
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+
+
+def test_existing_state_merge_rejects_changed_review_hash_without_writing(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path.resolve() / "agent-state"
+    parent.mkdir(mode=0o700)
+    path = parent / "state.json"
+    path.write_bytes(b'{"nodes":{"6":{}}}\n')
+    path.chmod(0o600)
+    monkeypatch.setattr(adopt.os, "geteuid", lambda: 0)
+    original_stat = Path.stat
+
+    def root_owned(candidate, *args, **kwargs):
+        result = original_stat(candidate, *args, **kwargs)
+        if candidate == path:
+            fields = list(result)
+            fields[4] = 0
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, "stat", root_owned)
+    mock_service(monkeypatch)
+    original_bytes = path.read_bytes()
+    with pytest.raises(adopt.AdoptionError, match="changed after plan"):
+        adopt.merge_existing_state(
+            path,
+            {"nodes": {"5": {}}},
+            SERVICE,
+            "0" * 64,
+        )
+    assert path.read_bytes() == original_bytes
+    assert {p.name for p in parent.iterdir()} == {"state.json"}

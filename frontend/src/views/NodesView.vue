@@ -1,8 +1,8 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { api } from "../api.js";
 import { formatBytes, timeAgo } from "../format.js";
-import { pushToast } from "../store.js";
+import { dataRefreshVersion, pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
 import { isRealNode, nodeStatus } from "../noc/data.js";
 
@@ -293,6 +293,7 @@ async function removeNode() {
   }
 }
 
+watch(dataRefreshVersion, () => load());
 onMounted(load);
 </script>
 
@@ -322,7 +323,7 @@ onMounted(load);
     <div class="table-head">
       <button class="table-head-cell" type="button" :aria-sort="sortKey === 'name' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('name')">节点 <span>{{ sortArrow('name') }}</span></button>
       <button class="table-head-cell" type="button" :aria-sort="sortKey === 'protocol' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('protocol')">协议 / 入口 <span>{{ sortArrow('protocol') }}</span></button>
-      <button class="table-head-cell" type="button" :aria-sort="sortKey === 'traffic' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('traffic')">24h 流量 <span>{{ sortArrow('traffic') }}</span></button>
+      <button class="table-head-cell" type="button" :aria-sort="sortKey === 'traffic' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('traffic')">24h 可计量流量 <span>{{ sortArrow('traffic') }}</span></button>
       <button class="table-head-cell" type="button" :aria-sort="sortKey === 'status' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'" @click="toggleSort('status')">状态 <span>{{ sortArrow('status') }}</span></button>
       <span class="table-head-label">操作</span>
     </div>
@@ -332,7 +333,7 @@ onMounted(load);
         <div class="table-main-copy"><h3>{{ node.name }}</h3><span>ID {{ node.id }} · 已分配 {{ node.allocated_to || 0 }} 人</span></div>
       </div>
       <div class="table-cell"><strong>{{ node.protocol }}</strong><span>{{ node.server }}:{{ node.port }}</span></div>
-      <div class="table-cell table-flow"><strong>{{ formatBytes(node.traffic?.['24h']?.total || 0) }}</strong><div class="bar table-bar"><i :style="{ '--meter': `${Math.max(2, Math.round((Number(node.traffic?.['24h']?.total || 0) / maxTraffic) * 100))}%` }"></i></div></div>
+      <div class="table-cell table-flow"><strong>{{ formatBytes(node.traffic?.['24h']?.total || 0) }}</strong><span v-if="node.traffic_updated_at" class="lbl-cn">更新于 {{ timeAgo(node.traffic_updated_at) }}</span><span v-else class="lbl-cn">等待代理统计</span><div class="bar table-bar"><i :style="{ '--meter': `${Math.max(2, Math.round((Number(node.traffic?.['24h']?.total || 0) / maxTraffic) * 100))}%` }"></i></div></div>
       <div class="table-cell">
         <strong class="table-state" :class="statusTone(node)">{{ nodeStatus(node).text }}</strong>
         <span v-if="node.updated_at">配置更新：{{ timeAgo(node.updated_at) }}</span>

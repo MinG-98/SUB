@@ -2165,3 +2165,92 @@ def test_agent_apply_does_not_reactivate_disabled_or_grace_credentials(tmp_path:
         assert disabled_row.status == "pending"
     finally:
         db.close()
+
+
+def test_node_traffic_uses_user_attributed_proxy_records_not_nezha_totals(
+    tmp_path: Path,
+):
+    factory = make_session_factory(str(tmp_path / "traffic-reporting.db"))
+    db = factory()
+    try:
+        node = Node(
+            name="traffic fixture",
+            protocol="hysteria2",
+            uri="hysteria2://fixture",
+        )
+        db.add(node)
+        db.flush()
+        friends = [
+            Friend(uid=f"traffic-user-{index}", token=f"traffic-token-{index}")
+            for index in (10, 11)
+        ]
+        db.add_all(friends)
+        db.flush()
+        now = utcnow().replace(tzinfo=None)
+        db.add_all(
+            [
+                FlowRecord(
+                    node_id=node.id,
+                    friend_id=friends[0].id,
+                    bucket=now - timedelta(minutes=5),
+                    created_at=now,
+                    source="hysteria2",
+                    bytes_in=101,
+                    bytes_out=202,
+                ),
+                FlowRecord(
+                    node_id=node.id,
+                    friend_id=friends[1].id,
+                    bucket=now - timedelta(minutes=5),
+                    created_at=now,
+                    source="vless",
+                    bytes_in=303,
+                    bytes_out=404,
+                ),
+                FlowRecord(
+                    node_id=node.id,
+                    bucket=now - timedelta(minutes=5),
+                    created_at=now,
+                    source="nezha",
+                    bytes_in=10**12,
+                    bytes_out=10**12,
+                ),
+                FlowRecord(
+                    node_id=node.id,
+                    bucket=now - timedelta(minutes=5),
+                    created_at=now,
+                    source="unknown",
+                    bytes_in=10**9,
+                    bytes_out=10**9,
+                ),
+                NodeMetricSample(
+                    node_id=node.id,
+                    nezha_server_id=1,
+                    bucket=now - timedelta(minutes=5),
+                    collected_at=utcnow(),
+                    delta_in=10**12,
+                    delta_out=10**12,
+                ),
+            ]
+        )
+        db.commit()
+
+        summary = main_module._node_traffic_summary(db, node.id)
+        assert summary["24h"] == {
+            "bytes_in": 404,
+            "bytes_out": 606,
+            "total": 1010,
+        }
+        assert summary["7d"] == summary["24h"]
+        assert summary["30d"] == summary["24h"]
+        detail = main_module.node_traffic(node.id, "24h", db=db, _={})
+        assert detail["source"] == "proxy_agent"
+        assert detail["totals"] == {"bytes_in": 404, "bytes_out": 606}
+        assert len(detail["points"]) == 1
+        assert detail["points"][0]["bytes_in"] == 404
+        report = main_module.node_dict(node, db=db)
+        assert report["traffic"]["24h"]["total"] == 1010
+        assert report["traffic_source"] == "proxy_agent"
+        assert report["traffic_updated_at"] is not None
+    finally:
+        db.close()

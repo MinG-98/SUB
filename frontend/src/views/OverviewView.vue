@@ -1,9 +1,9 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "../api.js";
 import { formatBytes, formatLatency, formatPercent, timeAgo } from "../format.js";
-import { pushToast } from "../store.js";
+import { dataRefreshVersion, pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
 import { activityByUser, healthRows, isAnnouncement, isRealNode, probeState } from "../noc/data.js";
 
@@ -31,7 +31,7 @@ function byteParts(value) {
 }
 
 async function load() {
-  loading.value = true;
+  if (!nodes.value.length && !Object.keys(stats.value).length) loading.value = true;
   error.value = "";
   try {
     const [s, n, l, d, c] = await Promise.all([
@@ -57,14 +57,14 @@ const kpis = computed(() => {
     { label: "节点总数", value: real.length, sub: `${nodes.value.length - real.length} 条备注不计入` },
     { label: "在线节点", value: online, state: online === real.length && real.length ? "ok" : online ? "warn" : "bad", sub: `${formatPercent(real.length ? (online / real.length) * 100 : 0)} 可用` },
     { label: "用户数", value: stats.value.friends || 0, sub: "订阅账户" },
-    { label: "24h 流量", value: traffic.num, unit: traffic.unit, sub: "代理出网" },
+    { label: "24h 流量", value: traffic.num, unit: traffic.unit, sub: "已计量代理流量" },
     { label: "24h 拉取", value: Number(stats.value.fetch_24h || 0).toLocaleString("zh-CN"), sub: "订阅请求次数" },
   ];
 });
 
 const traffic = computed(() => {
   const key = range.value === "all" ? "30d" : range.value;
-  const rows = nodes.value.filter(isRealNode).map((node) => ({
+  const rows = nodes.value.filter((node) => isRealNode(node) && node.enabled).map((node) => ({
     id: node.id,
     name: node.name,
     bytes: node.traffic?.[key]?.total ?? null,
@@ -196,6 +196,7 @@ async function removeAnnouncement() {
   }
 }
 
+watch(dataRefreshVersion, () => load());
 onMounted(load);
 </script>
 
@@ -253,7 +254,7 @@ onMounted(load);
               <div v-if="row.off" class="row-sub"><span class="mk idle">已停用</span></div>
             </div>
           </div>
-          <div v-else class="st"><b>暂无流量数据</b><span>还没有节点上报统计。</span></div>
+          <div v-else class="st"><b>暂无流量数据</b><span>还没有代理核心上报可归属到用户的流量。</span></div>
           <div class="p-ft"><template v-if="range === 'all'">「全部」区间当前显示 30d 数据。</template>共 {{ traffic.rows.length }} 个节点，已显示流量最高的前 {{ traffic.shown.length }} 个 · <a href="#" @click.prevent="router.push({name:'nodes'})">查看节点 →</a></div>
         </template>
 

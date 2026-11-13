@@ -85,6 +85,11 @@ validate a JSON production configuration.
    It does not install/start services. Managed users are **not** legacy users;
    only fingerprint-approved shared credentials enter the fixed grace window.
    Xray flow is retained independently even when no shared credential exists.
+   If a standard Agent already manages different nodes, use `--merge-state`
+   instead of `--prepare-state`: it binds to the reviewed state-file hash,
+   rejects node-ID overlap, and atomically adds the new node without dropping
+   existing counters or pending traffic outbox records. Stop all services that
+   can write that state before merging.
 4. Install the reviewed source, private Agent config and service; start the new
    controller. Its first native apply can restart the proxy cores, so treat
    this as a bounded cutover, not a zero-interruption update. Before disabling
