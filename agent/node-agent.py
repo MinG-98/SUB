@@ -30,7 +30,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 MAX_PENDING_TRAFFIC_RECORDS = 2048
 MAX_TRAFFIC_BATCH_RECORDS = 128
 
@@ -517,7 +517,7 @@ class Agent:
         node_id = int(spec["node_id"])
         state = self.node_state(node_id)
         old_auth = config.get("auth") or {}
-        if not state.get("legacy_auth") and isinstance(old_auth, dict):
+        if "legacy_auth" not in state and isinstance(old_auth, dict):
             if old_auth.get("type") == "password" and old_auth.get("password"):
                 state["legacy_auth"] = [str(old_auth["password"])]
             elif old_auth.get("type") == "userpass":
@@ -828,7 +828,7 @@ class Agent:
             state["xray_legacy_until"] = utcnow().timestamp() + 86400
             self.save_state()
         legacy = state["xray_legacy"]
-        flow = legacy[0].get("flow", "") if legacy else ""
+        flow = state.get("xray_flow", legacy[0].get("flow", "") if legacy else "")
         clients = {}
         if mode == "per_user" and utcnow().timestamp() < state["xray_legacy_until"]:
             clients.update((u["id"], copy.deepcopy(u)) for u in legacy)

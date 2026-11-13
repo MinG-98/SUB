@@ -24,11 +24,15 @@ be deployed and watched before it is allowed to touch any config.
 
 ## Supported layouts
 
+Existing multi-user native services require the explicit
+[verified adoption workflow](ADOPTION.md); starting the Agent is not a dry run.
+
 | Layout | Auth path | Notes |
 | --- | --- | --- |
 | Standalone Hysteria2 | Agent serves a loopback HTTP auth backend | Agent is in the auth path — supervise it |
 | Hysteria2 as a sing-box inbound | sing-box validates in-process | Agent not in the auth path |
 | VLESS Reality (sing-box) | sing-box validates in-process | Needs `with_v2ray_api` build — see [BUILD.md](BUILD.md) |
+| VLESS Reality (native Xray) | Xray validates in-process | Explicit inbound selection; native config test and stats API |
 
 Prefer folding Hysteria2 into sing-box where possible: a dead agent then costs
 traffic accounting, not connectivity.
