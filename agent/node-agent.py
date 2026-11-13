@@ -30,7 +30,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 MAX_PENDING_TRAFFIC_RECORDS = 2048
 MAX_TRAFFIC_BATCH_RECORDS = 128
 
@@ -546,7 +546,14 @@ class Agent:
         else:
             state["traffic_secret"] = str(traffic["secret"])
         config["trafficStats"] = traffic
-        content = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
+        # Native Hysteria chooses its parser by filename extension. JSON is a
+        # YAML subset, but the reverse is not true: writing YAML into *.json
+        # makes the real service reject a config that our YAML parser accepts.
+        content = (
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+            if path.suffix.lower() == ".json"
+            else yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
+        )
         # poll_node calls apply on every cycle.  Without this guard the proxy
         # core would be rewritten and restarted every poll interval, dropping
         # every live connection on a loop.

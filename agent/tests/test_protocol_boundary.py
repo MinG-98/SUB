@@ -105,10 +105,11 @@ def test_valid_legacy_field_shapes_remain_supported(protocol, user, mode):
     )
 
 
+@pytest.mark.parametrize("suffix", [".json", ".yaml"])
 def test_explicit_empty_hy2_legacy_is_not_recaptured_during_adoption(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, suffix
 ):
-    path = tmp_path / "hy2.json"
+    path = tmp_path / ("hy2" + suffix)
     path.write_text(
         json.dumps(
             {
@@ -139,6 +140,16 @@ def test_explicit_empty_hy2_legacy_is_not_recaptured_during_adoption(
     monkeypatch.setattr(agent_mod.Agent, "_service_restart", lambda *_: True)
     desired = {"protocol": "hysteria2", "mode": "per_user", "users": []}
     agent.apply_hysteria(spec, desired)
+    if suffix == ".json":
+        assert json.loads(path.read_text())["auth"]["type"] == "http"
+    first = path.read_bytes()
+    monkeypatch.setattr(
+        agent_mod.Agent,
+        "_service_restart",
+        lambda *_: pytest.fail("unchanged config must not restart the service"),
+    )
+    agent.apply_hysteria(spec, desired)
+    assert path.read_bytes() == first
     reloaded = agent_mod.Agent(config)
     reloaded.desired[6] = desired
     assert reloaded.node_state(6)["legacy_auth"] == []

@@ -32,8 +32,10 @@ def stage(manifest, module, desired, directory):
     config["state_path"] = str(directory / "state.json")
     for spec in config["nodes"]:
         key = "xray_config" if spec["protocol"] == "vless" else "hysteria_config"
-        suffix = ".json" if spec["protocol"] == "vless" else ".yaml"
         original = spec[key]
+        # The native engine selects its parser from this suffix. Staging must
+        # preserve it or it can hide production-only config parsing failures.
+        suffix = Path(original).suffix
         spec[key] = str(directory / f"node-{spec['node_id']}{suffix}")
         data = snapshot(original)
         if digest(data) != files[original]:

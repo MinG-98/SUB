@@ -118,3 +118,61 @@ def test_candidate_validation_never_rewrites_or_restarts_live_service(
     assert checks
     assert live.read_bytes() == original
     assert not (tmp_path / "live-state.json").exists()
+
+
+def test_native_hy2_staging_preserves_json_engine_parser(tmp_path, monkeypatch):
+    live = tmp_path / "native.json"
+    original = {
+        "listen": ":8443",
+        "auth": {"type": "userpass", "userpass": {"f1n6v1": "fixture"}},
+    }
+    live.write_text(json.dumps(original))
+    desired = {
+        "node_id": 6,
+        "protocol": "hysteria2",
+        "mode": "per_user",
+        "enabled": True,
+        "apply": True,
+        "users": [
+            {
+                "protocol": "hysteria2",
+                "stats_id": "f1n6v1",
+                "username": "f1n6v1",
+                "password": "fixture",
+            }
+        ],
+    }
+    desired["generation"] = hashlib.sha256(
+        json.dumps(
+            desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    manifest = {
+        "legacy_deadline": (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat(),
+        "shared_sha256": {"6": []},
+        "agent_config": {
+            "endpoint": "https://control.invalid",
+            "state_path": str(tmp_path / "live-state.json"),
+            "nodes": [
+                {
+                    "node_id": 6,
+                    "protocol": "hysteria2",
+                    "hysteria_config": str(live),
+                    "auth_port": 19081,
+                    "stats_port": 19082,
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        module.Agent, "_service_restart", lambda *_: pytest.fail("no live restart")
+    )
+    stage_adoption.stage(manifest, module, {6: desired}, tmp_path / "staged")
+    candidate = json.loads((tmp_path / "staged/node-6.json").read_text())
+    assert candidate["listen"] == original["listen"]
+    assert candidate["auth"]["type"] == "http"
+    assert not (tmp_path / "staged/node-6.yaml").exists()
+    assert json.loads(live.read_text()) == original
+    assert not (tmp_path / "live-state.json").exists()
