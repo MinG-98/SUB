@@ -5,13 +5,14 @@ import { api } from "../api.js";
 import { formatBytes, formatLatency, formatPercent, timeAgo } from "../format.js";
 import { dataRefreshVersion, pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
-import { activityByUser, healthRows, isAnnouncement, isRealNode, probeState } from "../noc/data.js";
+import { activityByUser, healthRows, isRealNode, probeState } from "../noc/data.js";
 
 const router = useRouter();
 const loading = ref(true);
 const error = ref("");
 const stats = ref({});
 const nodes = ref([]);
+const announcements = ref([]);
 const latency = ref({});
 const devices = ref([]);
 const collector = ref({});
@@ -34,11 +35,12 @@ async function load() {
   if (!nodes.value.length && !Object.keys(stats.value).length) loading.value = true;
   error.value = "";
   try {
-    const [s, n, l, d, c] = await Promise.all([
-      api.stats(), api.nodes(), api.latencyStatus(), api.devices(), api.collectorStatus(),
+    const [s, n, l, d, c, a] = await Promise.all([
+      api.stats(), api.nodes(), api.latencyStatus(), api.devices(), api.collectorStatus(), api.announcements(),
     ]);
     stats.value = s || {};
     nodes.value = n || [];
+    announcements.value = a || [];
     latency.value = l || {};
     devices.value = d || [];
     collector.value = c || {};
@@ -54,7 +56,7 @@ const kpis = computed(() => {
   const online = real.filter((node) => node.collector?.online).length;
   const traffic = byteParts(stats.value.flow_24h_bytes);
   return [
-    { label: "节点总数", value: real.length, sub: `${nodes.value.length - real.length} 条备注不计入` },
+    { label: "节点总数", value: real.length, sub: "仅统计真实代理节点" },
     { label: "在线节点", value: online, state: online === real.length && real.length ? "ok" : online ? "warn" : "bad", sub: `${formatPercent(real.length ? (online / real.length) * 100 : 0)} 可用` },
     { label: "用户数", value: stats.value.friends || 0, sub: "订阅账户" },
     { label: "24h 流量", value: traffic.num, unit: traffic.unit, sub: "已计量代理流量" },
@@ -117,7 +119,6 @@ const probe = computed(() => {
   };
 });
 
-const announcements = computed(() => nodes.value.filter(isAnnouncement));
 const health = computed(() => healthRows({ stats: stats.value, nodes: nodes.value, latency: latency.value, devices: devices.value, collector: collector.value }));
 async function runProbe() {
   if (probing.value) return;
@@ -150,15 +151,9 @@ async function saveAnnouncement() {
   announcementError.value = "";
   try {
     if (editingAnnouncement.value) {
-      await api.updateNode(editingAnnouncement.value.id, { name, enabled: announcementForm.value.enabled });
+      await api.updateAnnouncement(editingAnnouncement.value.id, { name, enabled: announcementForm.value.enabled });
     } else {
-      const uri = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none#${encodeURIComponent(name)}`;
-      await api.createNodes({ uri, name });
-      if (!announcementForm.value.enabled) {
-        const fresh = await api.nodes();
-        const created = [...fresh].reverse().find((node) => isAnnouncement(node) && node.name === name);
-        if (created) await api.updateNode(created.id, { enabled: false });
-      }
+      await api.createAnnouncement({ name, enabled: announcementForm.value.enabled });
     }
     pushToast(editingAnnouncement.value ? "备注已更新" : "备注已创建", "success");
     showAnnouncement.value = false;
@@ -172,7 +167,7 @@ async function saveAnnouncement() {
 
 async function toggleAnnouncement(node) {
   try {
-    await api.updateNode(node.id, { enabled: !node.enabled });
+    await api.updateAnnouncement(node.id, { enabled: !node.enabled });
     pushToast(node.enabled ? "已取消发布" : "已发布", "success");
     await load();
   } catch (e) {
@@ -182,10 +177,12 @@ async function toggleAnnouncement(node) {
 
 async function removeAnnouncement() {
   const node = editingAnnouncement.value;
-  if (!node || !window.confirm(`确定删除备注「${node.name}」？`)) return;
+  if (!node) return;
+  const impact = node.allocated_to ? `这会从 ${node.allocated_to} 位用户的订阅中移除。` : "";
+  if (!window.confirm(`确定删除备注「${node.name}」？${impact}`)) return;
   announcementBusy.value = true;
   try {
-    await api.deleteNode(node.id);
+    await api.deleteAnnouncement(node.id);
     pushToast("备注已删除", "success");
     showAnnouncement.value = false;
     await load();
@@ -300,7 +297,8 @@ onMounted(load);
         <div class="p-hd"><h2 id="h-ann">备注节点</h2><button class="b" @click="openAnnouncement()">新增</button></div>
         <div v-if="announcements.length">
           <div v-for="node in announcements" :key="node.id" class="ann">
-            <div class="ann-nm">{{ node.name }}</div><span class="mk" :class="node.enabled ? 'ok' : 'idle'">{{ node.enabled ? "已发布" : "草稿" }}</span>
+            <div class="ann-main"><div class="ann-nm">{{ node.name }}</div><span class="n">已分配 {{ node.allocated_to || 0 }} 位用户</span></div>
+            <span class="mk" :class="node.enabled ? 'ok' : 'idle'">{{ node.enabled ? "已发布" : "草稿" }}</span>
             <div class="ann-ac"><button class="b" @click="openAnnouncement(node)">编辑</button><button class="b" @click="toggleAnnouncement(node)">{{ node.enabled ? "取消发布" : "发布" }}</button></div>
           </div>
         </div>
