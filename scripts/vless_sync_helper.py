@@ -31,7 +31,9 @@ MAX_REQUEST_BYTES = 1024 * 1024
 MAX_USERS = 10000
 FLOW_VALUES = {"", "xtls-rprx-vision"}
 USER_NAME_RE = re.compile(
-    r"^(?:f[1-9][0-9]*n[1-9][0-9]*v[1-9][0-9]*|sub-app-disabled)$"
+    r"^(?:f[1-9][0-9]*n[1-9][0-9]*v[1-9][0-9]*|"
+    r"f[1-9][0-9]*d[1-9][0-9]*-[0-9a-f]{12}n[1-9][0-9]*v[1-9][0-9]*|"
+    r"sub-app-disabled)$"
 )
 
 

@@ -23,7 +23,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.account_policy import is_expired  # noqa: E402
-from app.credentials import credential_stats_id  # noqa: E402
+from app.credentials import (  # noqa: E402
+    credential_scope_is_allowed,
+    credential_stats_id,
+)
 from app.models import (  # noqa: E402
     CollectorRun,
     FlowRecord,
@@ -200,6 +203,8 @@ def collect_hysteria(db, now):
     by_id = {}
     current_time = utcnow().replace(tzinfo=None)
     for row, _friend in rows:
+        if not credential_scope_is_allowed(row, _friend):
+            continue
         if is_expired(_friend.expires_at):
             continue
         if row.status == "grace" and (
@@ -251,6 +256,7 @@ def collect_hysteria(db, now):
             flow = FlowRecord(
                 node_id=node_id,
                 friend_id=row.friend_id,
+                device_id=row.device_id,
                 bucket=bucket,
                 source="hysteria2",
                 sample_key=key,
@@ -260,6 +266,7 @@ def collect_hysteria(db, now):
             db.add(flow)
         else:
             flow.friend_id = row.friend_id
+            flow.device_id = row.device_id
             flow.bytes_in += delta_in
             flow.bytes_out += delta_out
         written += 1
@@ -318,6 +325,8 @@ def collect_vless(db, now):
     by_id = {}
     current_time = utcnow().replace(tzinfo=None)
     for row, _friend in rows:
+        if not credential_scope_is_allowed(row, _friend):
+            continue
         if is_expired(_friend.expires_at):
             continue
         if row.status == "grace" and (
@@ -385,6 +394,7 @@ def collect_vless(db, now):
             flow = FlowRecord(
                 node_id=node_id,
                 friend_id=row.friend_id,
+                device_id=row.device_id,
                 bucket=bucket,
                 source="vless",
                 sample_key=key,
@@ -394,6 +404,7 @@ def collect_vless(db, now):
             db.add(flow)
         else:
             flow.friend_id = row.friend_id
+            flow.device_id = row.device_id
             flow.bytes_in += delta_in
             flow.bytes_out += delta_out
         written += 1

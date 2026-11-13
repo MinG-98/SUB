@@ -156,6 +156,9 @@ function realNodeCount(friend) {
 }
 
 function authState(friend) {
+  if (friend.device_credentials_mode === "required") return { tone: "ok", text: "设备凭据隔离" };
+  if (friend.device_credentials_mode === "preparing") return { tone: "warn", text: "设备凭据准备中" };
+  if (friend.device_credentials_mode === "restoring") return { tone: "warn", text: "兼容凭据恢复中" };
   if (!friend.per_user_credentials) return { tone: "idle", text: "共享凭据" };
   const rows = friend.credential_status || [];
   if (rows.some((row) => row.status === "error")) return { tone: "bad", text: "专属 · 有错误" };
@@ -180,17 +183,104 @@ function credentialStatus(status) {
 }
 
 const credentialGroups = computed(() => {
-  const groups = new Map();
+  const nodes = new Map();
   for (const row of credentials.value) {
-    const group = groups.get(row.node_id) || [];
+    const nodeScopes = nodes.get(row.node_id) || new Map();
+    const scope = row.device_id ? `device-${row.device_id}` : "account";
+    const group = nodeScopes.get(scope) || [];
     group.push(row);
-    groups.set(row.node_id, group);
+    nodeScopes.set(scope, group);
+    nodes.set(row.node_id, nodeScopes);
   }
-  return [...groups.entries()].map(([nodeId, rows]) => {
-    rows.sort((a, b) => Number(b.version) - Number(a.version));
-    return { nodeId, node: nodeById.value.get(nodeId), current: rows[0], history: rows.slice(1) };
-  }).sort((a, b) => a.nodeId - b.nodeId);
+  return [...nodes.entries()].map(([nodeId, scopes]) => ({
+    nodeId,
+    node: nodeById.value.get(nodeId),
+    scopes: [...scopes.entries()].map(([scope, rows]) => {
+      rows.sort((a, b) => Number(b.version) - Number(a.version));
+      const current = rows[0];
+      return {
+        key: `${nodeId}:${scope}`,
+        scopeLabel: current.device_id ? (current.device_label || `设备 #${current.device_id}`) : "账户级",
+        current,
+        history: rows.slice(1),
+      };
+    }).sort((a, b) => Number(a.current.device_id || 0) - Number(b.current.device_id || 0)),
+  })).sort((a, b) => a.nodeId - b.nodeId);
 });
+
+function credentialGroupStatus(group) {
+  const statuses = group.scopes.map((scope) => scope.current.status);
+  return ["error", "pending", "active", "grace"].find((status) => statuses.includes(status)) || "revoked";
+}
+
+function deviceModeLabel(friend) {
+  return {
+    off: "兼容模式",
+    preparing: "准备中",
+    required: "严格隔离",
+    restoring: "恢复中",
+  }[friend.device_credentials_mode || "off"] || "状态未知";
+}
+
+function deviceModeDescription(friend) {
+  const mode = friend.device_credentials_mode || "off";
+  const progress = friend.device_credential_progress || {};
+  if (mode === "preparing") {
+    return `准备阶段保留旧订阅凭据；设备凭据已应用 ${progress.active_credentials || 0}/${progress.required_credentials || 0}。全部就绪后才能启用严格隔离。`;
+  }
+  if (mode === "required") {
+    return `严格隔离已启用：设备凭据 ${progress.active_credentials || 0}/${progress.required_credentials || 0} 正常。未登记链接不能刷新订阅。`;
+  }
+  if (mode === "restoring") {
+    return `正在恢复兼容凭据；账户凭据已应用 ${progress.active_global_credentials || 0}/${progress.required_global_credentials || 0}。全部就绪后再次点击完成恢复。`;
+  }
+  return `默认兼容旧订阅。准备会先创建每台登记设备的独立代理凭据，不会立即停用旧链接。当前有 ${friend.device_count || 0} 条设备记录；准备要求至少一条有效登记链接。`;
+}
+
+function deviceModeActionLabel(friend) {
+  const mode = friend.device_credentials_mode || "off";
+  if (mode === "preparing") return "启用严格隔离";
+  if (mode === "required") return "恢复兼容订阅";
+  if (mode === "restoring") return "检查恢复进度";
+  return "准备设备级凭据";
+}
+
+function deviceModeAction(friend) {
+  const mode = friend.device_credentials_mode || "off";
+  if (mode === "off") return "prepare";
+  if (mode === "preparing") return "activate";
+  return "restore";
+}
+
+async function runDeviceCredentialAction() {
+  const friend = editing.value;
+  if (!friend) return;
+  const action = deviceModeAction(friend);
+  const confirmation = action === "activate"
+    ? `启用「${friend.uid}」的严格设备隔离？未登记设备的通用订阅链接会停止工作；请确认每台在用设备都已有独立链接。`
+    : action === "restore"
+      ? `为「${friend.uid}」恢复兼容订阅？系统会先等所有节点应用账户级凭据，再撤销设备凭据。`
+      : `为「${friend.uid}」准备设备级凭据？现有通用订阅暂时保持可用。`;
+  if (!window.confirm(confirmation)) return;
+  busy.value = true;
+  formError.value = "";
+  try {
+    const fn = {
+      prepare: api.prepareDeviceCredentials,
+      activate: api.activateDeviceCredentials,
+      restore: api.restoreCompatibleCredentials,
+    }[action];
+    const result = await fn(friend.id);
+    pushToast(result.message || `设备凭据${deviceModeLabel({ device_credentials_mode: result.mode })}`, "success");
+    await load();
+    editing.value = friends.value.find((item) => item.id === friend.id) || null;
+    if (editing.value) credentials.value = await api.friendCredentials(friend.id);
+  } catch (e) {
+    formError.value = e.message || "设备凭据模式切换失败";
+  } finally {
+    busy.value = false;
+  }
+}
 
 async function copyText(value, label) {
   try {
@@ -407,7 +497,15 @@ onMounted(load);
     <div class="form-row"><label for="friend-expiry">订阅到期日（留空表示不限期）</label><input id="friend-expiry" v-model="form.expires_at" type="date"></div>
     <div class="form-row"><label for="friend-flow">用户级可计量流量配额（GB，0 表示不限）</label><input id="friend-flow" v-model="form.flow_limit_gb" type="number" min="0"><small>达到后会阻止刷新订阅，并在下一次协调时撤销可计量的独立凭据。共享凭据节点无法按用户强制断流。</small></div>
     <div class="form-row"><label for="friend-device">设备上限（0 表示不限）</label><input id="friend-device" v-model="form.device_limit" type="number" min="0"></div>
-    <div class="check"><input id="friend-peruser" v-model="form.per_user_credentials" type="checkbox"><label for="friend-peruser">启用用户级独立凭据；只向该用户下发同步成功的节点凭据</label></div>
+    <div class="check"><input id="friend-peruser" v-model="form.per_user_credentials" type="checkbox" :disabled="editing && editing.device_credentials_mode !== 'off'"><label for="friend-peruser">启用用户级独立凭据；只向该用户下发同步成功的节点凭据</label></div>
+    <p v-if="editing && editing.device_credentials_mode !== 'off'" class="form-hint">设备隔离切换中不能关闭用户级独立凭据；请先恢复兼容订阅。</p>
+
+    <section v-if="editing" class="credential-group device-credential-mode">
+      <div class="credential-main"><strong>设备级凭据隔离</strong><span class="mk" :class="editing.device_credentials_mode === 'required' ? 'ok' : ['preparing', 'restoring'].includes(editing.device_credentials_mode) ? 'warn' : 'idle'">{{ deviceModeLabel(editing) }}</span></div>
+      <p class="form-hint">{{ deviceModeDescription(editing) }}</p>
+      <p class="form-hint">这是基于已登记订阅链接的逻辑隔离，不是硬件指纹认证；链接持有人仍可复制使用。</p>
+      <div class="credential-actions"><button class="b b-am" :disabled="busy || (!form.per_user_credentials && (editing.device_credentials_mode || 'off') === 'off') || ((editing.device_credentials_mode || 'off') === 'off' && (!editing.device_count || !editing.node_ids?.length)) || (editing.device_credentials_mode === 'preparing' && !editing.device_credential_progress?.ready)" @click="runDeviceCredentialAction">{{ deviceModeActionLabel(editing) }}</button></div>
+    </section>
 
     <details class="fold">
       <summary>分配真实节点 <span class="n">{{ form.node_ids.filter((id) => realNodes.some((node) => node.id === id)).length }}/{{ realNodes.length }}</span></summary>
@@ -428,17 +526,20 @@ onMounted(load);
     <div v-if="editing" class="check"><input id="friend-rotate" v-model="form.rotate_token" type="checkbox"><label for="friend-rotate">重置订阅 Token；保存后旧订阅链接立即失效</label></div>
 
     <details v-if="editing" class="fold">
-      <summary>用户级凭据 <span class="n">{{ credentialGroups.length }} 个节点</span></summary>
+      <summary>独立凭据详情 <span class="n">{{ credentialGroups.length }} 个节点</span></summary>
       <div class="fold-body">
         <div v-if="credentialsLoading" class="loading-lines"><div v-for="index in 3" :key="index" class="sk sk-line"></div></div>
         <div v-else-if="credentialGroups.length" class="credential-groups">
-          <section v-for="group in credentialGroups" :key="group.nodeId" class="credential-group">
-            <div class="credential-main"><div class="credential-name">{{ group.node?.name || `节点 #${group.nodeId}` }}</div><span class="mk" :class="credentialStatus(group.current.status).tone">{{ credentialStatus(group.current.status).text }}</span></div>
-            <div class="credential-meta"><span>{{ String(group.current.protocol || "—").toUpperCase() }}</span><span>版本 {{ group.current.version }}</span><span>{{ group.current.last_synced_at ? `同步于 ${timeAgo(group.current.last_synced_at)}` : "尚未同步" }}</span></div>
-            <div v-if="group.current.last_error" class="form-error">{{ group.current.last_error }}</div>
-            <div v-if="group.current.status !== 'revoked'" class="credential-actions"><button class="b" :disabled="credentialBusy[group.current.id]" @click="credentialAction(group.current, 'sync')">同步</button><button class="b" :disabled="credentialBusy[group.current.id]" @click="credentialAction(group.current, 'rotate')">轮换</button><button class="b b-bad" :disabled="credentialBusy[group.current.id]" @click="credentialAction(group.current, 'revoke')">撤销</button></div>
-            <details v-if="group.history.length" class="credential-history"><summary>历史记录 {{ group.history.length }}</summary><div v-for="row in group.history" :key="row.id" class="credential-history-row"><span>版本 {{ row.version }} · {{ credentialStatus(row.status).text }}</span><span>{{ timeAgo(row.revoked_at || row.rotated_at || row.created_at) }}</span></div></details>
-          </section>
+          <details v-for="group in credentialGroups" :key="group.nodeId" class="credential-group credential-node-group">
+            <summary class="credential-main"><div class="credential-name">{{ group.node?.name || `节点 #${group.nodeId}` }}<span class="credential-meta">{{ group.scopes.length }} 种凭据范围</span></div><span class="mk" :class="credentialStatus(credentialGroupStatus(group)).tone">{{ credentialStatus(credentialGroupStatus(group)).text }}</span></summary>
+            <section v-for="scope in group.scopes" :key="scope.key" class="credential-scope">
+              <div class="credential-main"><div class="credential-name">{{ scope.scopeLabel }}</div><span class="mk" :class="credentialStatus(scope.current.status).tone">{{ credentialStatus(scope.current.status).text }}</span></div>
+              <div class="credential-meta"><span>{{ String(scope.current.protocol || "—").toUpperCase() }}</span><span>版本 {{ scope.current.version }}</span><span>{{ scope.current.last_synced_at ? `同步于 ${timeAgo(scope.current.last_synced_at)}` : "尚未同步" }}</span></div>
+              <div v-if="scope.current.last_error" class="form-error">{{ scope.current.last_error }}</div>
+              <div v-if="scope.current.status !== 'revoked'" class="credential-actions"><button class="b" :disabled="credentialBusy[scope.current.id]" @click="credentialAction(scope.current, 'sync')">同步</button><button class="b" :disabled="credentialBusy[scope.current.id]" @click="credentialAction(scope.current, 'rotate')">轮换</button><button v-if="!scope.current.device_id" class="b b-bad" :disabled="credentialBusy[scope.current.id]" @click="credentialAction(scope.current, 'revoke')">撤销</button><span v-else class="form-hint">设备凭据请在设备页封锁或撤销</span></div>
+              <details v-if="scope.history.length" class="credential-history"><summary>历史记录 {{ scope.history.length }}</summary><div v-for="row in scope.history" :key="row.id" class="credential-history-row"><span>版本 {{ row.version }} · {{ credentialStatus(row.status).text }}</span><span>{{ timeAgo(row.revoked_at || row.rotated_at || row.created_at) }}</span></div></details>
+            </section>
+          </details>
         </div>
         <div v-else class="st"><b>暂无用户级凭据</b><span>启用独立凭据并保存后，支持的节点会开始同步。</span></div>
       </div>

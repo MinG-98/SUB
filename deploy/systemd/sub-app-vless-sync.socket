@@ -1,5 +1,5 @@
 [Unit]
-Description=Restricted VLESS configuration sync socket for Sub App
+Description=Restricted VLESS configuration sync socket for SUB
 
 [Socket]
 ListenStream=/run/sub-app-vless-sync.sock

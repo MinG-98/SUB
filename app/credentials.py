@@ -9,10 +9,10 @@ import os
 import uuid
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.converter import parse_uri, uri_with_name
-from app.models import Friend, Node, UserNodeCredential, utc_iso, utcnow
+from app.models import Device, Friend, Node, UserNodeCredential, utc_iso, utcnow
 
 
 def per_user_feature_enabled() -> bool:
@@ -24,6 +24,24 @@ def per_user_feature_enabled() -> bool:
     }
 
 
+def credential_scope_is_allowed(
+    row: UserNodeCredential, friend: Friend | None = None
+) -> bool:
+    """Whether this row belongs in the currently selected auth mode."""
+    friend = friend or row.friend
+    mode = getattr(friend, "device_credentials_mode", "off") or "off"
+    if row.device_id is None:
+        return mode in {"off", "preparing", "restoring"}
+    device = row.device
+    return bool(
+        mode in {"preparing", "required", "restoring"}
+        and device is not None
+        and device.device_token_hash
+        and device.device_token_revoked_at is None
+        and not device.blocked
+    )
+
+
 def _key_material() -> bytes:
     secret = os.environ.get("SUB_APP_SECRET", "")
     if not secret:
@@ -31,8 +49,20 @@ def _key_material() -> bytes:
     return secret.encode("utf-8")
 
 
-def _digest(friend_id: int, node_id: int, protocol: str, version: int) -> bytes:
-    message = f"sub-app-credential:v1:{friend_id}:{node_id}:{protocol}:{version}"
+def _digest(
+    friend_id: int,
+    node_id: int,
+    protocol: str,
+    version: int,
+    device_scope: str | None = None,
+) -> bytes:
+    if device_scope:
+        message = (
+            f"sub-app-device-credential:v1:{friend_id}:{device_scope}:"
+            f"{node_id}:{protocol}:{version}"
+        )
+    else:
+        message = f"sub-app-credential:v1:{friend_id}:{node_id}:{protocol}:{version}"
     return hmac.new(_key_material(), message.encode("utf-8"), hashlib.sha256).digest()
 
 
@@ -47,7 +77,15 @@ def deny_all_uuid(node_id: int) -> str:
 
 
 def credential_values(row: UserNodeCredential) -> dict[str, str]:
-    digest = _digest(row.friend_id, row.node_id, row.protocol, row.version)
+    device_scope = None
+    if row.device_id is not None:
+        device = row.device
+        if device is None or not device.credential_scope:
+            raise ValueError("device-scoped credential has no stable device scope")
+        device_scope = device.credential_scope
+    digest = _digest(
+        row.friend_id, row.node_id, row.protocol, row.version, device_scope
+    )
     password = base64.urlsafe_b64encode(digest[16:]).decode().rstrip("=")
     if row.protocol == "vless":
         return {"uuid": str(uuid.UUID(bytes=digest[:16]))}
@@ -58,28 +96,54 @@ def credential_values(row: UserNodeCredential) -> dict[str, str]:
 
 def credential_stats_id(row: UserNodeCredential) -> str:
     """Stable internal ID returned to a proxy stats backend."""
+    if row.device_id is not None:
+        device = row.device
+        if device is None or not device.credential_scope:
+            raise ValueError("device-scoped credential has no stable device scope")
+        scope_tag = hashlib.sha256(device.credential_scope.encode("utf-8")).hexdigest()[
+            :12
+        ]
+        return (
+            f"f{row.friend_id}d{row.device_id}-{scope_tag}n{row.node_id}v{row.version}"
+        )
     return f"f{row.friend_id}n{row.node_id}v{row.version}"
 
 
-def ensure_credential(db, friend: Friend, node: Node) -> UserNodeCredential:
-    row = db.scalar(
-        select(UserNodeCredential)
-        .where(
-            UserNodeCredential.friend_id == friend.id,
-            UserNodeCredential.node_id == node.id,
-            UserNodeCredential.protocol == node.protocol,
-        )
-        .order_by(UserNodeCredential.version.desc())
-        .limit(1)
+def ensure_credential(
+    db, friend: Friend, node: Node, device: Device | int | None = None
+) -> UserNodeCredential:
+    device_id = device.id if isinstance(device, Device) else device
+    scope_query = select(UserNodeCredential).where(
+        UserNodeCredential.friend_id == friend.id,
+        UserNodeCredential.node_id == node.id,
+        UserNodeCredential.protocol == node.protocol,
     )
+    scope_query = scope_query.where(
+        UserNodeCredential.device_id.is_(None)
+        if device_id is None
+        else UserNodeCredential.device_id == device_id
+    )
+    row = db.scalar(scope_query.order_by(UserNodeCredential.version.desc()).limit(1))
     if row is not None and row.revoked_at is None:
         return row
-    next_version = (row.version + 1) if row is not None else 1
+    latest_version = (
+        db.scalar(
+            select(func.max(UserNodeCredential.version)).where(
+                UserNodeCredential.friend_id == friend.id,
+                UserNodeCredential.node_id == node.id,
+                UserNodeCredential.protocol == node.protocol,
+            )
+        )
+        or 0
+    )
+    next_version = latest_version + 1
+    device_label = f"d{device_id}" if device_id is not None else ""
     row = UserNodeCredential(
         friend_id=friend.id,
         node_id=node.id,
+        device_id=device_id,
         protocol=node.protocol,
-        credential_name=f"u{friend.id}n{node.id}",
+        credential_name=f"u{friend.id}{device_label}n{node.id}",
         version=next_version,
         status="pending",
         created_at=utcnow(),
@@ -124,6 +188,8 @@ def credential_public_dict(row: UserNodeCredential) -> dict:
     return {
         "id": row.id,
         "friend_id": row.friend_id,
+        "device_id": row.device_id,
+        "device_label": row.device.label if row.device_id and row.device else None,
         "node_id": row.node_id,
         "protocol": row.protocol,
         "credential_name": row.credential_name,

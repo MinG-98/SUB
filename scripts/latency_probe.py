@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded real proxy latency probe for sub-app."""
+"""Run the bounded real proxy latency probe for SUB."""
 
 from __future__ import annotations
 

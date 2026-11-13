@@ -1,5 +1,5 @@
 [Unit]
-Description=Sub App administration and subscription service
+Description=SUB administration and subscription service
 After=network-online.target
 Wants=network-online.target
 

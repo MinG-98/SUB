@@ -1,4 +1,4 @@
-/* Modernist shell translated from SUBAPP Console.dc.html. */
+/* Modernist shell translated from SUB Console.dc.html. */
 .shell {
   display: grid;
   grid-template-columns: 1fr;
@@ -402,6 +402,10 @@
 .credential-groups { display: flex; flex-direction: column; border-top: var(--rule-major) solid var(--color-divider); }
 .credential-group { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-4) 0; border-bottom: var(--rule-minor) solid var(--rule); }
 .credential-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-2) var(--space-4); }
+.credential-node-group > summary { cursor: pointer; list-style: none; }
+.credential-node-group > summary::-webkit-details-marker { display: none; }
+.credential-node-group > summary .credential-meta { display: block; margin-top: var(--space-1); }
+.credential-scope { padding-top: var(--space-3); border-top: var(--rule-minor) dashed var(--rule); }
 .credential-name { min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .credential-meta { display: flex; align-items: center; gap: var(--space-3); color: var(--ink-2); font-size: 11.5px; flex-wrap: wrap; }
 .credential-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }

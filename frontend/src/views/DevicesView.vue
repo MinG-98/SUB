@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
 import { api } from "../api.js";
-import { timeAgo } from "../format.js";
+import { formatBytes, timeAgo } from "../format.js";
 import { dataRefreshVersion, pushToast } from "../store.js";
 import Modal from "../components/Modal.vue";
 
@@ -21,6 +21,8 @@ const createLabel = ref("");
 const createBusy = ref(false);
 const createError = ref("");
 const createdLinks = ref(null);
+const createdNotice = ref("");
+const createdCredentialProgress = ref(null);
 
 const detail = ref(null);
 const detailForm = ref({ label: "", blocked: false });
@@ -112,9 +114,25 @@ function toggleAllGroups() {
 watch([search, filter], () => { groupOpenOverrides.value = new Map(); });
 
 function identityState(device) {
-  if (device.device_link_active) return { tone: "info", text: "专属订阅链接" };
-  if (device.identity_source === "device_link") return { tone: "bad", text: "链接已撤销" };
+  if (device.device_link_active) return { tone: "info", text: "登记链接" };
+  if (device.identity_source === "device_link") return { tone: "bad", text: "登记链接已撤销" };
   return { tone: "idle", text: "旧版 UA+IP" };
+}
+
+function deviceCredentialState(device) {
+  const mode = device.friend_device_credentials_mode || "off";
+  const counts = device.device_credentials || {};
+  const active = Number(counts.active || 0);
+  const pending = Number(counts.pending || 0) + Number(counts.error || 0);
+  if (mode === "required") return { tone: active ? "ok" : "bad", text: active ? `独立凭据 ${active}` : "无有效设备凭据" };
+  if (mode === "preparing") return { tone: "warn", text: `隔离准备中 · ${active} 已生效${pending ? ` · ${pending} 待处理` : ""}` };
+  if (mode === "restoring") return { tone: "warn", text: "兼容凭据恢复中" };
+  return { tone: "idle", text: "兼容模式" };
+}
+
+function deviceTraffic(device) {
+  const traffic = device.traffic || {};
+  return formatBytes(Number(traffic.bytes_in || 0) + Number(traffic.bytes_out || 0));
 }
 
 function statusState(device) {
@@ -137,6 +155,8 @@ function openCreate() {
   createLabel.value = "";
   createError.value = "";
   createdLinks.value = null;
+  createdNotice.value = "";
+  createdCredentialProgress.value = null;
   showCreate.value = true;
 }
 
@@ -150,6 +170,8 @@ async function submitCreate() {
   try {
     const result = await api.createDeviceLink(createFriendId.value, createLabel.value);
     createdLinks.value = result.links;
+    createdNotice.value = result.notice || "链接只显示一次，请立即复制并妥善保管。";
+    createdCredentialProgress.value = result.credential_progress || null;
     pushToast("设备专属订阅链接已创建", "success");
     await load();
   } catch (e) {
@@ -206,8 +228,14 @@ async function revokeLink() {
   if (!detail.value || !window.confirm("确定撤销该设备专属订阅链接？")) return;
   detailBusy.value = true;
   try {
-    await api.revokeDeviceLink(detail.value.id);
-    pushToast("链接已撤销", "success");
+    const result = await api.revokeDeviceLink(detail.value.id);
+    if (result.proxy_config_sync_error) {
+      pushToast(`登记链接已撤销，但代理端凭据未确认移除：${result.proxy_config_sync_error}`, "error");
+    } else {
+      pushToast(result.device_credentials_revoked
+        ? "登记链接已撤销；设备代理凭据已同步移除"
+        : "登记链接已撤销；兼容模式账户凭据未改变", "success");
+    }
     detail.value = null;
     await load();
   } catch (e) {
@@ -238,7 +266,7 @@ onMounted(load);
 
 <template>
   <header class="view-hd">
-    <div class="view-copy"><span class="lbl lbl-am">DEVICE MANAGEMENT</span><h2>设备管理</h2><p>按用户收纳订阅访问记录；默认只看近 30 天。访问记录不等于真实的手机或电脑。</p></div>
+    <div class="view-copy"><span class="lbl lbl-am">DEVICE MANAGEMENT</span><h2>设备管理</h2><p>按用户收纳订阅访问记录；默认只看近 30 天。登记链接可实现逻辑隔离，但不是硬件指纹，也不证明访问者就是某台真实设备。</p></div>
     <div class="view-actions">
       <label class="search"><span aria-hidden="true">/</span><span class="visually-hidden">搜索设备</span><input v-model="search" placeholder="搜用户、设备名、客户端或 IP（当前范围）"></label>
       <button class="b b-am" @click="openCreate">新建设备链接</button>
@@ -289,6 +317,8 @@ onMounted(load);
             <div class="device-record-meta">
               <span class="mk" :class="statusState(device).tone">{{ statusState(device).text }}</span>
               <span>{{ Number(device.fetch_count || 0).toLocaleString("zh-CN") }} 次拉取</span>
+              <span>流量 {{ deviceTraffic(device) }}</span>
+              <span class="mk" :class="deviceCredentialState(device).tone">{{ deviceCredentialState(device).text }}</span>
               <span v-if="device.last_ip">{{ device.last_ip }}</span>
             </div>
             <button class="b" type="button" @click="openDetail(device)">详情</button>
@@ -300,7 +330,8 @@ onMounted(load);
 
   <Modal v-if="showCreate" title="创建设备专属订阅链接" @close="showCreate = false">
     <template v-if="createdLinks">
-      <p class="form-hint">链接只在本次显示一次，数据库仅保存不可逆哈希。请现在复制给对应设备。</p>
+      <p class="form-hint">{{ createdNotice }} 请现在复制给对应设备。它是可转移的持有者凭据，不是硬件指纹。</p>
+      <p v-if="createdCredentialProgress && createdCredentialProgress.required_credentials" class="form-hint" role="status">设备凭据同步进度：{{ createdCredentialProgress.active_credentials }}/{{ createdCredentialProgress.required_credentials }}；严格模式下全部节点同步完成前，刷新订阅会暂时失败。</p>
       <div class="link-box"><code>{{ createdLinks.clash }}</code><button class="b" @click="copyText(createdLinks.clash, 'Clash 链接')">复制 Clash</button></div>
       <div class="link-box"><code>{{ createdLinks.shadowrocket }}</code><button class="b" @click="copyText(createdLinks.shadowrocket, '小火箭链接')">复制小火箭</button></div>
       <div class="link-box"><code>{{ createdLinks.v2ray }}</code><button class="b" @click="copyText(createdLinks.v2ray, 'V2Ray 链接')">复制 V2Ray</button></div>
@@ -323,7 +354,7 @@ onMounted(load);
       <div class="modal-foot"><button class="b b-am" @click="detail = null">完成</button></div>
     </template>
     <template v-else>
-      <div class="device-detail-summary"><span class="mk" :class="statusState(detail).tone">{{ statusState(detail).text }}</span><span>{{ detail.friend_uid }}</span><span>最近访问 {{ timeAgo(detail.last_seen) }}</span></div>
+      <div class="device-detail-summary"><span class="mk" :class="statusState(detail).tone">{{ statusState(detail).text }}</span><span>{{ detail.friend_uid }}</span><span>最近访问 {{ timeAgo(detail.last_seen) }}</span><span class="mk" :class="deviceCredentialState(detail).tone">{{ deviceCredentialState(detail).text }}</span></div>
       <div class="form-row"><label for="detail-label">设备备注</label><input id="detail-label" v-model="detailForm.label" placeholder="未命名"></div>
       <div class="check"><input id="detail-blocked" v-model="detailForm.blocked" type="checkbox"><label for="detail-blocked">封锁该访问记录</label></div>
       <details class="fold device-detail-fold">
@@ -336,12 +367,15 @@ onMounted(load);
           <div class="detail-item"><dt>最近 IP</dt><dd class="mono">{{ detail.last_ip || "—" }}</dd></div>
           <div class="detail-item"><dt>首次访问</dt><dd>{{ timeAgo(detail.first_seen) }}</dd></div>
           <div class="detail-item"><dt>拉取次数</dt><dd class="mono">{{ Number(detail.fetch_count || 0).toLocaleString("zh-CN") }}</dd></div>
+          <div class="detail-item"><dt>已采集代理流量</dt><dd class="mono">{{ deviceTraffic(detail) }} <span class="faint">（上行 {{ formatBytes(detail.traffic?.bytes_in || 0) }} · 下行 {{ formatBytes(detail.traffic?.bytes_out || 0) }}）</span></dd></div>
+          <div class="detail-item"><dt>流量最近记录</dt><dd>{{ detail.traffic?.last_seen ? timeAgo(detail.traffic.last_seen) : "暂无独立流量样本" }}</dd></div>
+          <div class="detail-item"><dt>代理凭据</dt><dd>{{ deviceCredentialState(detail).text }} <span class="faint">· {{ detail.friend_device_credentials_mode === "required" ? "严格隔离" : detail.friend_device_credentials_mode === "preparing" ? "准备中" : detail.friend_device_credentials_mode === "restoring" ? "恢复中" : "兼容模式" }}</span></dd></div>
         </dl></div>
       </details>
       <details class="fold device-actions-fold">
         <summary>链接管理与删除</summary>
         <div class="fold-body">
-          <p class="form-hint">轮换或撤销会立即影响设备专属链接；删除会移除这条访问记录。</p>
+          <p class="form-hint">轮换或撤销会立即影响登记链接；若启用了设备级凭据，撤销/封锁后对应代理凭据会在节点同步后移除。仅轮换链接不会改变已经导入客户端的代理凭据。删除会移除记录，但不会证明或识别真实硬件。</p>
           <div class="device-admin-actions"><button class="b" :disabled="detailBusy" @click="rotateLink">{{ detail.identity_source === 'device_link' ? '轮换专属链接' : '原名额转专属链接' }}</button><button v-if="detail.device_link_active" class="b b-bad" :disabled="detailBusy" @click="revokeLink">撤销链接</button><button class="b b-bad" :disabled="detailBusy" @click="removeDevice">删除访问记录</button></div>
         </div>
       </details>

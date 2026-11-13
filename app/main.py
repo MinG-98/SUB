@@ -21,6 +21,7 @@ from app.account_policy import is_expired as _is_expired
 from app.converter import parse_uri, render
 from app.credentials import (
     credential_public_dict,
+    credential_scope_is_allowed,
     ensure_credential,
     per_user_feature_enabled,
 )
@@ -148,7 +149,7 @@ def _session_version_for_config(fingerprint, session_factory=None, secret_key=No
 
 ADMIN_SESSION_VERSION = _session_version_for_config(ADMIN_CREDENTIAL_FINGERPRINT)
 
-app = FastAPI(title="Sub App", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="SUB", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 @app.middleware("http")
@@ -389,6 +390,108 @@ def _credential_rows_for_friend(db, friend_id: int):
     ).all()
 
 
+DEVICE_CREDENTIAL_MODES = {"off", "preparing", "required", "restoring"}
+
+
+def _active_device_links(db, friend_id: int) -> list[Device]:
+    return db.scalars(
+        select(Device)
+        .where(
+            Device.friend_id == friend_id,
+            Device.device_token_hash.is_not(None),
+            Device.device_token_revoked_at.is_(None),
+            Device.blocked.is_(False),
+        )
+        .order_by(Device.id)
+    ).all()
+
+
+def _device_mode_nodes(db, friend_id: int) -> list[Node]:
+    allocations = db.scalars(
+        select(Allocation).where(Allocation.friend_id == friend_id)
+    ).all()
+    return [
+        allocation.node
+        for allocation in allocations
+        if allocation.node is not None
+        and allocation.node.enabled
+        and is_real_node(allocation.node)
+        and not _is_expired(allocation.node.expires_at)
+    ]
+
+
+def _validate_device_credentials_supported(
+    db, friend: Friend
+) -> tuple[list[Device], list[Node]]:
+    if not per_user_feature_enabled():
+        raise HTTPException(409, "服务端尚未启用用户级独立凭据功能")
+    if not friend.enabled or _is_expired(friend.expires_at):
+        raise HTTPException(409, "停用或已到期用户不能启用设备级凭据隔离")
+    if not friend.per_user_credentials:
+        raise HTTPException(409, "请先启用用户级独立凭据")
+    devices = _active_device_links(db, friend.id)
+    if not devices:
+        raise HTTPException(409, "至少需要一台已登记且链接有效的设备")
+    nodes = _device_mode_nodes(db, friend.id)
+    if not nodes:
+        raise HTTPException(409, "用户没有已启用且有效的节点分配")
+    unavailable = []
+    for node in nodes:
+        if (
+            not adapter_info(node)
+            or not node_per_user_enabled(node)
+            or not adapter_ready(node, db)
+        ):
+            unavailable.append(node.name or f"节点 {node.id}")
+    if unavailable:
+        raise HTTPException(
+            409,
+            "以下节点尚不能应用设备独立凭据：" + "、".join(unavailable),
+        )
+    return devices, nodes
+
+
+def _device_credentials_progress(db, friend: Friend) -> dict:
+    devices = _active_device_links(db, friend.id)
+    nodes = _device_mode_nodes(db, friend.id)
+    rows = _credential_rows_for_friend(db, friend.id)
+    by_scope = {}
+    for row in rows:
+        if row.revoked_at is not None:
+            continue
+        scope = (row.device_id, row.node_id)
+        previous = by_scope.get(scope)
+        if previous is None or row.version > previous.version:
+            by_scope[scope] = row
+    credential_nodes = [
+        node
+        for node in nodes
+        if adapter_info(node) is not None and node_per_user_enabled(node)
+    ]
+    total = len(devices) * len(credential_nodes)
+    active = sum(
+        1
+        for device in devices
+        for node in credential_nodes
+        if (row := by_scope.get((device.id, node.id))) is not None
+        and row.status == "active"
+    )
+    global_active = sum(
+        1
+        for node in credential_nodes
+        if (row := by_scope.get((None, node.id))) is not None and row.status == "active"
+    )
+    return {
+        "active_devices": len(devices),
+        "required_credentials": total,
+        "active_credentials": active,
+        "ready": bool(total) and active == total,
+        "required_global_credentials": len(credential_nodes),
+        "active_global_credentials": global_active,
+        "restore_ready": global_active == len(credential_nodes),
+    }
+
+
 def _revoke_credential(db, row: UserNodeCredential):
     row.status = "revoked"
     row.revoked_at = utcnow()
@@ -397,7 +500,8 @@ def _revoke_credential(db, row: UserNodeCredential):
 
 
 def _reconcile_friend_credentials(db, friend: Friend):
-    """Reconcile selected US nodes without affecting shared remote nodes."""
+    """Reconcile account and enrolled-device credentials for assigned nodes."""
+    sync_error = ""
     allocations = db.scalars(
         select(Allocation).where(Allocation.friend_id == friend.id)
     ).all()
@@ -410,66 +514,96 @@ def _reconcile_friend_credentials(db, friend: Friend):
     }
     rows = _credential_rows_for_friend(db, friend.id)
     changed_vless = False
-    if (
-        not friend.per_user_credentials
-        or not friend.enabled
-        or _is_expired(friend.expires_at)
-    ):
+    vless_rows_to_sync: list[UserNodeCredential] = []
+    mode = friend.device_credentials_mode or "off"
+    if mode not in DEVICE_CREDENTIAL_MODES:
+        mode = "off"
+    active_devices = _active_device_links(db, friend.id)
+    global_modes = {"off", "preparing", "restoring"}
+    device_modes = {"preparing", "required", "restoring"}
+    account_active = (
+        friend.per_user_credentials
+        and friend.enabled
+        and not _is_expired(friend.expires_at)
+    )
+    wanted_scopes: set[tuple[int, int | None]] = set()
+    if account_active:
+        for node_id in wanted:
+            node = db.get(Node, node_id)
+            if not node or not adapter_info(node) or not node_per_user_enabled(node):
+                continue
+            if mode in global_modes:
+                wanted_scopes.add((node_id, None))
+            if mode in device_modes:
+                for device in active_devices:
+                    wanted_scopes.add((node_id, device.id))
+
+    if account_active:
+        for node_id, device_id in sorted(
+            wanted_scopes, key=lambda scope: (scope[0], scope[1] or 0)
+        ):
+            node = db.get(Node, node_id)
+            device = db.get(Device, device_id) if device_id is not None else None
+            row = ensure_credential(db, friend, node, device=device)
+            if row.status not in {"active", "grace"} or row.revoked_at is not None:
+                if is_local_vless(node):
+                    if adapter_ready(node, db):
+                        row.status = "active"
+                        row.last_error = ""
+                        row.last_synced_at = None
+                        vless_rows_to_sync.append(row)
+                        changed_vless = True
+                    else:
+                        row.status = "error"
+                        row.last_error = "VLESS V2Ray API 适配器未就绪"
+                        row.last_synced_at = None
+                else:
+                    activate_credential(db, row)
+
+    for row in rows:
+        if row.revoked_at is None and (row.node_id, row.device_id) not in wanted_scopes:
+            _revoke_credential(db, row)
+            node = db.get(Node, row.node_id)
+            changed_vless = changed_vless or bool(node and is_local_vless(node))
+
+    if not account_active:
         for row in rows:
             if row.revoked_at is None:
                 _revoke_credential(db, row)
                 node = db.get(Node, row.node_id)
                 changed_vless = changed_vless or bool(node and is_local_vless(node))
-        local_vless = db.scalar(
-            select(Node).where(
-                Node.adapter_kind == "local_vless", Node.protocol == "vless"
-            )
-        )
-        if changed_vless and local_vless and adapter_ready(local_vless, db):
-            try:
-                sync_vless_config(db)
-            except Exception as exc:
-                for row in rows:
-                    row_node = db.get(Node, row.node_id)
-                    if (
-                        row_node
-                        and is_local_vless(row_node)
-                        and row.status == "revoked"
-                    ):
-                        row.last_error = str(exc)[:1000]
-        return rows
-
-    for node_id in wanted:
-        node = db.get(Node, node_id)
-        if not node or not adapter_info(node) or not node_per_user_enabled(node):
-            continue
-        row = ensure_credential(db, friend, node)
-        if row.status not in {"active", "grace"} or row.revoked_at is not None:
-            activate_credential(db, row)
-            changed_vless = changed_vless or is_local_vless(node)
-
-    for row in rows:
-        if row.node_id not in wanted and row.revoked_at is None:
-            _revoke_credential(db, row)
-            row_node = db.get(Node, row.node_id)
-            changed_vless = changed_vless or bool(row_node and is_local_vless(row_node))
 
     local_vless = db.scalar(
         select(Node).where(Node.adapter_kind == "local_vless", Node.protocol == "vless")
     )
-    if changed_vless and local_vless and adapter_ready(local_vless, db):
-        try:
-            sync_vless_config(db)
-        except Exception as exc:
+    if changed_vless and local_vless:
+        if not adapter_ready(local_vless, db):
+            sync_error = "VLESS V2Ray API 适配器未就绪"
+        else:
+            db.flush()
+            try:
+                sync_vless_config(db)
+                synced_at = utcnow()
+                for row in vless_rows_to_sync:
+                    row.last_synced_at = synced_at
+                    row.last_error = ""
+            except Exception as exc:
+                sync_error = str(exc)[:1000] or "VLESS 配置同步失败"
+
+        if sync_error:
             for row in _credential_rows_for_friend(db, friend.id):
                 row_node = db.get(Node, row.node_id)
-                if (
-                    row_node
-                    and is_local_vless(row_node)
-                    and row.status in {"active", "grace"}
-                ):
+                if not row_node or not is_local_vless(row_node):
+                    continue
+                if row.status in {"active", "grace"}:
                     row.status = "error"
-                    row.last_error = str(exc)[:1000]
+                    row.last_error = sync_error
+                elif row.revoked_at is not None:
+                    row.last_error = (
+                        f"凭据已撤销，但代理端配置尚未确认同步：{sync_error}"
+                    )
+
+    return {"proxy_config_sync_error": sync_error}
 
 
 # ---------------------------------------------------------------- auth
@@ -1517,6 +1651,15 @@ def friend_dict(
     last_shared_fallback_nodes = 0
     last_skipped_node_count = 0
     last_expired_node_count = 0
+    device_credential_progress = {
+        "active_devices": 0,
+        "required_credentials": 0,
+        "active_credentials": 0,
+        "ready": False,
+        "required_global_credentials": 0,
+        "active_global_credentials": 0,
+        "restore_ready": False,
+    }
     if db is not None:
         credential_status = [
             credential_public_dict(row) for row in _credential_rows_for_friend(db, f.id)
@@ -1531,6 +1674,8 @@ def friend_dict(
             last_shared_fallback_nodes = latest_fetch.shared_fallback_count
             last_skipped_node_count = latest_fetch.skipped_node_count
             last_expired_node_count = latest_fetch.expired_node_count
+        if (f.device_credentials_mode or "off") != "off":
+            device_credential_progress = _device_credentials_progress(db, f)
     supported_ids = supported_node_ids(db)
     unsupported = [node_id for node_id in node_ids if node_id not in supported_ids]
     return {
@@ -1542,6 +1687,8 @@ def friend_dict(
         "flow_limit_gb": f.flow_limit_gb,
         "device_limit": f.device_limit,
         "per_user_credentials": f.per_user_credentials,
+        "device_credentials_mode": f.device_credentials_mode or "off",
+        "device_credential_progress": device_credential_progress,
         "credential_status": credential_status,
         "last_shared_fallback_nodes": last_shared_fallback_nodes,
         "last_skipped_node_count": last_skipped_node_count,
@@ -1754,6 +1901,11 @@ def update_friend(
     if "expires_at" in payload:
         friend.expires_at = _parse_expiry(payload["expires_at"], "expires_at")
 
+    if (friend.device_credentials_mode or "off") != "off" and payload.get(
+        "per_user_credentials"
+    ) is False:
+        raise HTTPException(409, "请先恢复兼容订阅，再关闭用户级独立凭据")
+
     if wanted is not None:
         current = {
             a.node_id: a
@@ -1788,11 +1940,107 @@ def update_friend(
         friend.token = new_token()
 
     db.flush()
+    if (
+        friend.device_credentials_mode in {"required", "preparing", "restoring"}
+        and wanted is not None
+    ):
+        _validate_device_credentials_supported(db, friend)
     _reconcile_friend_credentials(db, friend)
     db.commit()
     node_ids = _friend_node_ids(db).get(friend_id, [])
     announcement_ids = _friend_announcement_ids(db).get(friend_id, [])
     return friend_dict(friend, node_ids, db=db, announcement_ids=announcement_ids)
+
+
+def _device_credentials_action_result(db, friend: Friend, message: str = "") -> dict:
+    return {
+        "ok": True,
+        "mode": friend.device_credentials_mode or "off",
+        "progress": _device_credentials_progress(db, friend),
+        "message": message,
+    }
+
+
+@app.post("/api/admin/friends/{friend_id}/device-credentials/prepare")
+def prepare_device_credentials(
+    friend_id: int, db=Depends(get_db), _=Depends(require_admin)
+):
+    friend = db.get(Friend, friend_id)
+    if not friend:
+        raise HTTPException(404, "用户不存在")
+    if friend.device_credentials_mode not in {"off", "preparing"}:
+        raise HTTPException(409, "请先完成或恢复当前设备凭据切换")
+    _validate_device_credentials_supported(db, friend)
+    friend.device_credentials_mode = "preparing"
+    _reconcile_friend_credentials(db, friend)
+    db.commit()
+    return _device_credentials_action_result(
+        db, friend, "准备阶段保留原凭据；所有设备凭据应用完成后再启用严格隔离。"
+    )
+
+
+@app.post("/api/admin/friends/{friend_id}/device-credentials/activate")
+def activate_device_credentials(
+    friend_id: int, db=Depends(get_db), _=Depends(require_admin)
+):
+    friend = db.get(Friend, friend_id)
+    if not friend:
+        raise HTTPException(404, "用户不存在")
+    if friend.device_credentials_mode != "preparing":
+        raise HTTPException(409, "请先准备设备独立凭据")
+    _validate_device_credentials_supported(db, friend)
+    progress = _device_credentials_progress(db, friend)
+    if not progress["ready"]:
+        raise HTTPException(409, "仍有设备凭据未应用；请等待节点 Agent 同步后重试")
+    friend.device_credentials_mode = "required"
+    _reconcile_friend_credentials(db, friend)
+    db.commit()
+    return _device_credentials_action_result(
+        db,
+        friend,
+        "严格设备模式已启用；未登记设备的通用订阅入口将停止工作。旧代理配置会在节点完成同步后失效。",
+    )
+
+
+@app.post("/api/admin/friends/{friend_id}/device-credentials/restore")
+def restore_compatible_credentials(
+    friend_id: int, db=Depends(get_db), _=Depends(require_admin)
+):
+    friend = db.get(Friend, friend_id)
+    if not friend:
+        raise HTTPException(404, "用户不存在")
+    mode = friend.device_credentials_mode or "off"
+    if mode == "off":
+        return _device_credentials_action_result(db, friend, "已是兼容模式")
+    if mode not in {"required", "restoring", "preparing"}:
+        raise HTTPException(409, "未知的设备凭据状态")
+    if not friend.enabled or _is_expired(friend.expires_at):
+        friend.device_credentials_mode = "off"
+        _reconcile_friend_credentials(db, friend)
+        db.commit()
+        return _device_credentials_action_result(
+            db, friend, "用户已停用或到期，模式已复位"
+        )
+    friend.device_credentials_mode = "restoring"
+    _reconcile_friend_credentials(db, friend)
+    db.flush()
+    progress = _device_credentials_progress(db, friend)
+    if progress["restore_ready"]:
+        friend.device_credentials_mode = "off"
+        _reconcile_friend_credentials(db, friend)
+        db.commit()
+        return _device_credentials_action_result(
+            db, friend, "兼容订阅已恢复，设备级凭据已撤销。"
+        )
+    db.commit()
+    return {
+        **_device_credentials_action_result(
+            db,
+            friend,
+            "正在等待节点应用兼容凭据；再次点击可在同步完成后结束恢复。",
+        ),
+        "ready": False,
+    }
 
 
 @app.delete("/api/admin/friends/{friend_id}")
@@ -1854,25 +2102,13 @@ def friend_credentials(friend_id: int, db=Depends(get_db), _=Depends(require_adm
     rows = db.scalars(
         select(UserNodeCredential)
         .where(UserNodeCredential.friend_id == friend_id)
-        .order_by(UserNodeCredential.node_id, UserNodeCredential.version.desc())
+        .order_by(
+            UserNodeCredential.node_id,
+            UserNodeCredential.device_id,
+            UserNodeCredential.version.desc(),
+        )
     ).all()
-    return [
-        {
-            "id": row.id,
-            "node_id": row.node_id,
-            "protocol": row.protocol,
-            "credential_name": row.credential_name,
-            "version": row.version,
-            "status": row.status,
-            "created_at": _iso(row.created_at),
-            "rotated_at": _iso(row.rotated_at),
-            "revoked_at": _iso(row.revoked_at),
-            "grace_until": _iso(row.grace_until),
-            "last_synced_at": _iso(row.last_synced_at),
-            "last_error": row.last_error or "",
-        }
-        for row in rows
-    ]
+    return [credential_public_dict(row) for row in rows]
 
 
 @app.post("/api/admin/credentials/{credential_id}/sync")
@@ -1883,6 +2119,8 @@ def sync_credential(credential_id: int, db=Depends(get_db), _=Depends(require_ad
     friend = db.get(Friend, row.friend_id)
     if not friend or not friend.enabled or not friend.per_user_credentials:
         raise HTTPException(409, "用户未启用独立凭据")
+    if not credential_scope_is_allowed(row, friend):
+        raise HTTPException(409, "该凭据不属于当前设备授权模式")
     activate_credential(db, row)
     db.commit()
     return credential_public_dict(row)
@@ -1903,6 +2141,8 @@ def rotate_credential(credential_id: int, db=Depends(get_db), _=Depends(require_
         )
     if not friend.enabled or not friend.per_user_credentials:
         raise HTTPException(409, "用户未启用独立凭据")
+    if not credential_scope_is_allowed(old, friend):
+        raise HTTPException(409, "该凭据不属于当前设备授权模式")
     latest = db.scalar(
         select(UserNodeCredential)
         .where(
@@ -1921,8 +2161,10 @@ def rotate_credential(credential_id: int, db=Depends(get_db), _=Depends(require_
     row = UserNodeCredential(
         friend_id=old.friend_id,
         node_id=old.node_id,
+        device_id=old.device_id,
         protocol=old.protocol,
-        credential_name=f"u{old.friend_id}n{old.node_id}",
+        credential_name=old.credential_name,
+        device=old.device,
         version=(latest.version + 1) if latest else 1,
         status="pending",
         created_at=now,
@@ -1946,6 +2188,11 @@ def revoke_credential(credential_id: int, db=Depends(get_db), _=Depends(require_
     row = db.get(UserNodeCredential, credential_id)
     if not row:
         raise HTTPException(404, "凭据不存在")
+    if row.device_id is not None:
+        raise HTTPException(
+            409,
+            "设备凭据由设备状态统一管理；请在设备页封锁设备或撤销该设备链接。",
+        )
     _revoke_credential(db, row)
     row_node = db.get(Node, row.node_id)
     if row_node and is_local_vless(row_node) and adapter_ready(row_node, db):
@@ -1963,11 +2210,56 @@ def revoke_credential(credential_id: int, db=Depends(get_db), _=Depends(require_
 @app.get("/api/admin/devices")
 def list_devices(db=Depends(get_db), _=Depends(require_admin)):
     rows = db.execute(
-        select(Device, Friend.uid).join(Friend, Device.friend_id == Friend.id)
+        select(Device, Friend.uid, Friend.device_credentials_mode).join(
+            Friend, Device.friend_id == Friend.id
+        )
     ).all()
+    device_ids = [dev.id for dev, _uid, _mode in rows]
+    traffic = {}
+    credentials = {}
+    if device_ids:
+        traffic_since = utcnow().replace(tzinfo=None) - timedelta(days=30)
+        for device_id, bytes_in, bytes_out, last_seen in db.execute(
+            select(
+                FlowRecord.device_id,
+                func.coalesce(func.sum(FlowRecord.bytes_in), 0),
+                func.coalesce(func.sum(FlowRecord.bytes_out), 0),
+                func.max(FlowRecord.bucket),
+            )
+            .where(
+                FlowRecord.device_id.in_(device_ids),
+                FlowRecord.source != "nezha",
+                FlowRecord.bucket >= traffic_since,
+            )
+            .group_by(FlowRecord.device_id)
+        ).all():
+            traffic[device_id] = {
+                "bytes_in": int(bytes_in or 0),
+                "bytes_out": int(bytes_out or 0),
+                "last_seen": _iso(last_seen),
+            }
+        for device_id, status, count in db.execute(
+            select(
+                UserNodeCredential.device_id,
+                UserNodeCredential.status,
+                func.count(UserNodeCredential.id),
+            )
+            .where(
+                UserNodeCredential.device_id.in_(device_ids),
+                UserNodeCredential.revoked_at.is_(None),
+            )
+            .group_by(UserNodeCredential.device_id, UserNodeCredential.status)
+        ).all():
+            credentials.setdefault(device_id, {})[status] = int(count)
     out = []
-    for dev, uid in rows:
-        out.append(_device_dict(dev, uid))
+    for dev, uid, mode in rows:
+        item = _device_dict(dev, uid)
+        item["friend_device_credentials_mode"] = mode or "off"
+        item["traffic"] = traffic.get(
+            dev.id, {"bytes_in": 0, "bytes_out": 0, "last_seen": None}
+        )
+        item["device_credentials"] = credentials.get(dev.id, {})
+        out.append(item)
     out.sort(key=lambda d: d["last_seen"], reverse=True)
     return out
 
@@ -2013,12 +2305,22 @@ def create_device_link(
         last_seen=now,
     )
     db.add(dev)
+    db.flush()
+    if friend.device_credentials_mode != "off":
+        _validate_device_credentials_supported(db, friend)
+        _reconcile_friend_credentials(db, friend)
     db.commit()
     return {
         "ok": True,
         "device": _device_dict(dev, friend.uid),
         "links": _device_links(request, friend, raw_token),
-        "notice": "链接只在本次响应中返回；数据库仅保存哈希",
+        "notice": (
+            "链接只在本次响应中返回；数据库仅保存哈希。设备凭据尚未全部同步时，严格模式会暂时拒绝刷新订阅。"
+            if friend.device_credentials_mode == "required"
+            else "链接只在本次响应中返回；数据库仅保存哈希"
+        ),
+        "credential_mode": friend.device_credentials_mode or "off",
+        "credential_progress": _device_credentials_progress(db, friend),
     }
 
 
@@ -2040,12 +2342,16 @@ def rotate_device_link(
     dev.identity_source = "device_link"
     dev.device_token_created_at = now
     dev.device_token_revoked_at = None
+    db.flush()
+    if friend and friend.device_credentials_mode != "off":
+        _validate_device_credentials_supported(db, friend)
+        _reconcile_friend_credentials(db, friend)
     db.commit()
     return {
         "ok": True,
         "device": _device_dict(dev, friend.uid if friend else None),
         "links": _device_links(request, friend, raw_token) if friend else {},
-        "notice": "旧链接已失效；新链接只在本次响应中返回",
+        "notice": "旧链接已失效；新链接只在本次响应中返回。轮换订阅链接不会撤销已导入客户端中的代理凭据。",
     }
 
 
@@ -2055,8 +2361,20 @@ def revoke_device_link(device_id: int, db=Depends(get_db), _=Depends(require_adm
     if not dev:
         raise HTTPException(404, "设备不存在")
     dev.device_token_revoked_at = utcnow()
+    db.flush()
+    friend = db.get(Friend, dev.friend_id)
+    reconcile_result = {"proxy_config_sync_error": ""}
+    if friend:
+        reconcile_result = _reconcile_friend_credentials(db, friend)
     db.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "proxy_config_sync_error": reconcile_result["proxy_config_sync_error"],
+        "device_credentials_revoked": bool(
+            friend
+            and friend.device_credentials_mode in {"preparing", "required", "restoring"}
+        ),
+    }
 
 
 @app.patch("/api/admin/devices/{device_id}")
@@ -2072,9 +2390,12 @@ def update_device(
     for field in ("label", "blocked"):
         if field in payload:
             setattr(dev, field, payload[field])
+    db.flush()
+    friend = db.get(Friend, dev.friend_id)
+    if friend and "blocked" in payload:
+        _reconcile_friend_credentials(db, friend)
     db.commit()
-    uid = db.scalar(select(Friend.uid).where(Friend.id == dev.friend_id))
-    return {"ok": True, "device": _device_dict(dev, uid)}
+    return {"ok": True, "device": _device_dict(dev, friend.uid if friend else None)}
 
 
 @app.delete("/api/admin/devices/{device_id}")
@@ -2082,7 +2403,11 @@ def delete_device(device_id: int, db=Depends(get_db), _=Depends(require_admin)):
     dev = db.get(Device, device_id)
     if not dev:
         raise HTTPException(404, "设备不存在")
+    friend = db.get(Friend, dev.friend_id)
     db.delete(dev)
+    db.flush()
+    if friend:
+        _reconcile_friend_credentials(db, friend)
     db.commit()
     return {"ok": True}
 
@@ -2214,6 +2539,12 @@ def subscription(
         )
         if device_link is None and not _is_legacy_device_value(supplied_device):
             raise HTTPException(404, "设备订阅链接无效")
+    if friend.device_credentials_mode == "required" and device_link is None:
+        raise HTTPException(
+            403,
+            "此用户仅允许使用已登记设备的专属订阅链接",
+            headers={"x-sub-app-error-code": "device_link_required"},
+        )
     fp = (
         device_link.fingerprint
         if device_link
@@ -2260,7 +2591,12 @@ def subscription(
     )
     db.add(fetch_log)
 
-    plan = build_subscription_plan(db, friend, per_user_feature_enabled())
+    plan = build_subscription_plan(
+        db,
+        friend,
+        per_user_feature_enabled(),
+        device_id=dev.id if device_link else None,
+    )
     uris = plan.uris
     skipped_nodes = plan.skipped_nodes
     shared_fallback_nodes = []
@@ -2269,6 +2605,13 @@ def subscription(
     fetch_log.skipped_node_count = len(skipped_nodes)
     fetch_log.expired_node_count = len(expired_nodes)
     db.commit()
+
+    if friend.device_credentials_mode == "required" and skipped_nodes:
+        raise HTTPException(
+            503,
+            "该设备的独立凭据尚未在全部分配节点生效；为避免返回不完整订阅，暂时拒绝刷新",
+            headers={"x-sub-app-error-code": "device_credentials_pending"},
+        )
 
     if not uris:
         if skipped_nodes:

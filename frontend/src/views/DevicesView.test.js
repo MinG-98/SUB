@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { compileScript, compileTemplate, parse } from "@vue/compiler-sfc";
 import { transformSync } from "esbuild";
 import * as vue from "vue";
+import { formatBytes } from "../format.js";
 
 const source = readFileSync(new URL("./DevicesView.vue", import.meta.url), "utf8");
 const { descriptor } = parse(source);
@@ -15,7 +16,7 @@ const require = createRequire(import.meta.url);
 function setupDevices() {
   const day = 24 * 60 * 60 * 1000;
   const rows = [
-    { id: 1, friend_id: 10, friend_uid: "Ada", label: "手机", user_agent: "iPhone", last_ip: "192.0.2.1", last_seen: new Date(Date.now() - day).toISOString(), fetch_count: 4, blocked: false },
+    { id: 1, friend_id: 10, friend_uid: "Ada", label: "手机", user_agent: "iPhone", last_ip: "192.0.2.1", last_seen: new Date(Date.now() - day).toISOString(), fetch_count: 4, blocked: false, traffic: { bytes_in: 10, bytes_out: 20 }, friend_device_credentials_mode: "required", device_credentials: { active: 2 } },
     { id: 2, friend_id: 10, friend_uid: "Ada", label: "旧设备", user_agent: "Safari", last_seen: new Date(Date.now() - 80 * day).toISOString(), fetch_count: 7, blocked: true },
     { id: 3, friend_id: 20, friend_uid: "Bob", label: "电脑", user_agent: "Chrome", last_seen: new Date(Date.now() - 10 * day).toISOString(), fetch_count: 501, blocked: false },
     { id: 4, friend_id: 20, friend_uid: "Bob", label: "备用设备", user_agent: "Edge", last_seen: new Date(Date.now() - 40 * day).toISOString(), fetch_count: 2, blocked: false },
@@ -25,7 +26,7 @@ function setupDevices() {
   const scopedRequire = (id) => {
     if (id === "vue") return { ...vue, onMounted() {} };
     if (id === "../api.js") return { api: mockApi };
-    if (id === "../format.js") return { timeAgo: () => "刚刚" };
+    if (id === "../format.js") return { timeAgo: () => "刚刚", formatBytes };
     if (id === "../store.js") return { dataRefreshVersion: vue.ref(0), pushToast() {} };
     if (id.endsWith(".vue")) return { default: {} };
     return require(id);
@@ -42,6 +43,8 @@ test("device view defaults to recent records and groups the visible list by user
   assert.equal(state.filter.value, "recent");
   assert.deepEqual(state.summary.value, { total: 4, recent: 2, attention: 1, blocked: 1 });
   assert.equal(state.filtered.value.length, 2);
+  assert.equal(state.deviceTraffic(state.filtered.value.find((device) => device.id === 1)), "30 B");
+  assert.equal(state.deviceCredentialState(state.filtered.value.find((device) => device.id === 1)).text, "独立凭据 2");
   assert.deepEqual(state.groupedDevices.value.map((group) => [group.uid, group.devices.length]), [["Bob", 1], ["Ada", 1]]);
   assert.equal(state.isGroupExpanded(state.groupedDevices.value[0]), false);
 
@@ -66,4 +69,7 @@ test("device template compiles and keeps verbose audit fields behind the details
   assert.match(descriptor.template.content, /访问与客户端数据/);
   assert.match(descriptor.template.content, /完整 User-Agent/);
   assert.match(descriptor.template.content, /展开当前结果/);
+  assert.match(descriptor.template.content, /不是硬件指纹/);
+  assert.match(descriptor.template.content, /已采集代理流量/);
+  assert.match(descriptor.template.content, /流量 {{ deviceTraffic\(device\) }}/);
 });

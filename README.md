@@ -1,6 +1,6 @@
-# Sub App
+# SUB
 
-[![CI](https://github.com/MinG-98/sub-app/actions/workflows/ci.yml/badge.svg)](https://github.com/MinG-98/sub-app/actions/workflows/ci.yml)
+[![CI](https://github.com/MinG-98/SUB/actions/workflows/ci.yml/badge.svg)](https://github.com/MinG-98/SUB/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 
@@ -8,10 +8,12 @@
 
 代码开源以供参考；线上实例仅供本人个人使用，不开放注册，具体地址不在此公开。
 管理台使用 Hash 路由，页面链接请保留 `/#/overview`、`/#/nodes` 等 `#/` 部分；`/nodes` 这类无 Hash 的直链不是管理页面入口。
+产品品牌和 GitHub 仓库统一为 **SUB**。`SUB_APP_*` 环境变量、`sub-app` 服务/数据路径、Agent 请求头与凭据派生域属于已部署实例的兼容接口，本次不做破坏性改名。
 
 ## 目录
 
 - [功能](#功能)
+- [设备级凭据隔离](#设备级凭据隔离)
 - [观测与拓扑](#观测与拓扑)
 - [运维脚本与定时任务](#运维脚本与定时任务)
 - [新节点一键接入](#新节点一键接入)
@@ -30,7 +32,7 @@
 - 管理代理节点：批量粘贴、启用/停用、排序、编辑和删除。
 - 支持解析 `VLESS`、`VMess`、`Trojan`、`Hysteria2/Hy2` 和 `Shadowsocks` URI。
 - 管理订阅用户：UID、备注、节点分配、启用/停用和订阅令牌轮换。
-- 设备识别：根据订阅拉取请求记录设备指纹、User-Agent、IP、拉取次数和最近活动时间。
+- 设备访问记录：按订阅链接或旧版 UA/IP 归档访问标识、User-Agent、IP、拉取次数和最近活动；这些信号不等于真实硬件指纹。
 - 单独停用或删除设备，支持设备数量上限。
 - 生成 Base64/V2Ray/Shadowrocket 原始订阅，以及 Clash/Mihomo YAML 配置。
 - 仪表盘统计节点、用户、设备、24 小时拉取次数、活跃设备和最近拉取记录。
@@ -39,7 +41,27 @@
 - 通过独立采集脚本读取代理核心的用户级流量，并将哪吒整机流量与用户配额统计分开。
 - 从管理机一键部署全新 Debian/Ubuntu Hy2 VPS/NAT 节点并注册 Agent；部署前只读预检，部署后核对中心心跳与应用版本。
 - 为设备生成可撤销、可轮换的专属订阅访问标识，同时保留旧版 UA/IP 设备记录用于审计。
+- 可选设备级代理凭据隔离：按“准备 → 节点确认 → 严格启用”切换；恢复时先确认兼容凭据已应用，再撤销设备级凭据。
 - 使用 SQLite 持久化数据；公开 `/healthz` 只提供最小存活状态，详细健康信息通过需要管理员登录的 `/api/admin/healthz` 查看。
+
+## 设备级凭据隔离
+
+设备管理记录的是“哪条登记订阅链接访问过服务”，并非手机/电脑的硬件指纹。登记链接是 bearer 凭据，可以被复制或转发；当前系统不读取 IMEI、序列号、MAC 地址等硬件标识，也不能证明请求来自某一台真实设备。
+
+为减少一条订阅泄露影响其他客户端的范围，管理员可在用户编辑页启用设备级代理凭据隔离：
+
+1. 为每台客户端创建独立的登记链接，并在该客户端导入；旧 UA/IP 记录不会自动获得凭据。
+2. 在用户页点击“准备设备级凭据”。系统保留账户级凭据，同时为每个有效登记链接和已分配节点生成单独凭据。
+3. 等待所有目标节点确认应用后，再点击“启用严格隔离”。此后未登记链接不能刷新该用户订阅，代理认证也不再共享账户级凭据。
+4. 恢复兼容订阅时，系统先重新应用账户级凭据；确认目标节点均已生效后，再撤销设备级凭据并回到兼容模式。
+
+严格模式只允许在全局功能开关启用、用户已启用独立凭据、至少有一条有效登记链接，且所有有效分配节点都支持并能应用独立凭据时切换。协议或节点能力不满足时，切换会被拒绝，不会静默回退到共享认证。
+
+数据库 schema migration v17 为现有用户默认写入 `off`，给既有设备补充随机内部 scope，并为设备凭据新增可空关联；它不会重写任何现存凭据。发布前仍应按运维流程备份数据库。旧服务路径、环境变量和 Agent 协议继续兼容，不需要因品牌更名手工迁移目录。
+
+封锁设备或撤销登记链接会立即阻止后续使用该链接刷新订阅，并将该设备凭据标记为撤销；远端节点要等 Agent 下一次成功应用配置后才会移除旧代理凭据。已经导入客户端的配置在节点完成同步前仍可能可用。轮换订阅链接本身不会轮换已缓存的代理凭据；如怀疑代理凭据泄露，请同时轮换设备凭据并确认节点同步完成。
+
+设备页的代理流量按最近 30 天已采集的 Hysteria2/VLESS 用户计数器汇总。没有独立计数器的节点不贡献设备流量；显示 0 不代表没有实际使用。
 
 ## 观测与拓扑
 
@@ -182,8 +204,8 @@ export SUB_APP_PUBLIC_BASE='https://your-domain.example'
 ## 本地运行
 
 ```bash
-git clone https://github.com/MinG-98/sub-app.git
-cd sub-app
+git clone https://github.com/MinG-98/SUB.git
+cd SUB
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -208,10 +230,10 @@ uvicorn app.main:app --host 127.0.0.1 --port 8080 --no-access-log
 cd frontend
 npm ci
 npm run dev     # 本地开发，通过 vite 代理转发 /api、/sub、/healthz 到 127.0.0.1:8080
-npm run build   # 会清理并覆盖 ../static，仅用于明确的发布构建
+npm run build   # 默认写入 ../static；常规验证请指定临时 outDir
 ```
 
-`npm run dev` 默认将 API 请求代理到 `http://127.0.0.1:8080`（对应上一节的本地运行命令），需要本地已启动后端。常规开发和 CI 应把构建输出到临时目录；不要因此自动覆盖或提交 `static/`。CI 会将同一提交的后端源码与临时目录构建出的前端 `static/` 组装为保留 7 天的 GitHub Actions artifact；这只是未部署的发布候选，不会发布到生产或更新仓库 `static/`。下载后仍须先做 UI 验收并核实目标机的路径、环境文件、数据库和回滚方案。
+`npm run dev` 默认将 API 请求代理到 `http://127.0.0.1:8080`（对应上一节的本地运行命令），需要本地已启动后端。常规开发和 CI 应把构建输出到临时目录（例如 `npm run build -- --outDir /tmp/sub-ui-build`）；不要因此自动覆盖或提交 `static/`。CI 会将同一提交的后端源码与临时目录构建出的前端 `static/` 组装为保留 7 天的 GitHub Actions artifact；这只是未部署的发布候选，不会发布到生产或更新仓库 `static/`。下载后仍须先做 UI 验收并核实目标机的路径、环境文件、数据库和回滚方案。
 
 `deploy/systemd/sub-app.service` 是单机参考单元：假设代码安装在 `/opt/sub-app`、运行账号为 `sub-app`、环境文件为 `/etc/sub-app/app.env`、反向代理连接 `127.0.0.1:8080`；Uvicorn 使用单 worker，状态目录为权限受限的 `/var/lib/sub-app`，并关闭会记录 `/sub/{token}` 路径的访问日志。部署前须确认 `SUB_APP_DB` 等变量指向现有生产数据，而不是让新服务意外创建一份空数据库。此模板未在生产启用，也不替代现有 HTTPS 代理与定时采集服务。
 
@@ -232,6 +254,9 @@ npm run build   # 会清理并覆盖 ../static，仅用于明确的发布构建
 | `/api/admin/nodes/{id}/traffic` | 节点流量曲线和时间范围汇总 |
 | `POST /api/admin/agents` | 为已设为 `remote_agent` 的节点一次性签发 token |
 | `/api/admin/agents/{id}/rotate` | 分阶段轮换或取消 Agent token |
+| `POST /api/admin/friends/{id}/device-credentials/prepare` | 保留兼容凭据并准备设备独立凭据 |
+| `POST /api/admin/friends/{id}/device-credentials/activate` | 所有节点确认后启用严格设备隔离 |
+| `POST /api/admin/friends/{id}/device-credentials/restore` | 分阶段恢复账户级兼容凭据 |
 | `/api/admin/collector/status` | 哪吒、代理流量和节点 Agent 采集状态 |
 | `/api/admin/friends` | 订阅用户增删改查 |
 | `/api/admin/devices` | 设备记录管理 |

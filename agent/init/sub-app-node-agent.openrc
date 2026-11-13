@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="sub-app-node-agent"
-description="Sub App per-server node coordination agent"
+description="SUB per-server node coordination agent"
 
 # Without supervision a crashed agent never returns.  On nodes whose Hysteria2
 # runs as a standalone process the agent also serves the loopback auth backend,

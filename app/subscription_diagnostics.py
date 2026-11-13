@@ -67,10 +67,23 @@ def subscription_diagnostics(db, friend, target, device_id, feature_enabled):
         device = _decision(
             True, "allowed", "此记录可准入；须使用匹配的指纹或有效专属链接"
         )
-        if selected.device_token_hash and selected.device_token_revoked_at is not None:
+        if (
+            friend.device_credentials_mode == "required"
+            and not selected.device_token_hash
+        ):
+            device = _decision(
+                False, "device_link_required", "严格设备模式要求使用登记设备的专属链接"
+            )
+        elif (
+            selected.device_token_hash and selected.device_token_revoked_at is not None
+        ):
             device = _decision(False, "link_revoked", "该记录的专属链接已撤销")
         elif selected.blocked:
             device = _decision(False, "blocked", "设备已停用")
+    elif friend.device_credentials_mode == "required":
+        device = _decision(
+            False, "device_link_required", "严格设备模式不允许未登记设备刷新"
+        )
     elif friend.device_limit and len(devices) >= friend.device_limit:
         device = _decision(
             False,
@@ -84,7 +97,19 @@ def subscription_diagnostics(db, friend, target, device_id, feature_enabled):
         limit=friend.device_limit,
     )
 
-    plan = build_subscription_plan(db, friend, feature_enabled)
+    plan = build_subscription_plan(
+        db,
+        friend,
+        feature_enabled,
+        device_id=(
+            selected.id
+            if selected
+            and selected.device_token_hash
+            and selected.device_token_revoked_at is None
+            and not selected.blocked
+            else None
+        ),
+    )
     agents = {
         row.node_id: row
         for row in db.scalars(

@@ -57,7 +57,7 @@ onUnmounted(() => window.clearInterval(timer));
 <template>
   <div class="shell">
     <aside class="rail">
-      <div class="brand"><b>SA Console</b></div>
+      <div class="brand"><b>SUB</b></div>
       <nav aria-label="主导航">
         <router-link
           v-for="item in navItems"

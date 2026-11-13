@@ -21,6 +21,25 @@ class _Result:
         self.returncode = returncode
 
 
+def test_device_scoped_stats_identity_is_accepted(tmp_path):
+    device_stats_id = "f2d19-0123456789abn4v3"
+    config_path = tmp_path / "config.json"
+    _config(config_path, [])
+
+    helper.apply_vless_config(
+        _request(users=[{"name": device_stats_id, "uuid": str(uuid.uuid4())}]),
+        config_path=config_path,
+        marker_path=tmp_path / "proxy-adapters.env",
+        state_path=tmp_path / "state" / "applied.sha256",
+        binary="/test/sing-box",
+        service="test-sing-box.service",
+        runner=lambda *_args, **_kwargs: _Result(),
+    )
+
+    applied = json.loads(config_path.read_text(encoding="utf-8"))
+    assert applied["inbounds"][0]["users"][0]["name"] == device_stats_id
+
+
 def _request(*, enabled=True, users=None, deny_all_uuid=None, flow=""):
     return {
         "enabled": enabled,

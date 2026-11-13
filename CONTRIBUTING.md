@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢你关注 Sub App。这个项目是一个自托管的 FastAPI + Vue 3 节点订阅管理
+感谢你关注 SUB。这个项目是一个自托管的 FastAPI + Vue 3 节点订阅管理
 系统，贡献前请先了解它的安全边界：仓库只保存源代码和脱敏文档，个人部署的
 数据库、环境变量、节点配置和订阅凭据不属于贡献内容。
 
@@ -44,7 +44,7 @@ pytest -q
 ```bash
 cd frontend
 npm test
-npm run build -- --outDir /tmp/sub-app-ui-build
+npm run build -- --outDir /tmp/sub-ui-build
 ```
 
 构建应写入临时目录，不要因开发或 CI 而覆盖或提交仓库中的 `static/`。
@@ -58,7 +58,7 @@ CI 会从同一提交将前端构建结果与应用源码组装为短期发布�
 
 ## 分支和提交
 
-- 从 `master` 创建描述清晰的短期分支，例如 `agent/fix-issue-template`。
+- 从 `master` 创建描述清晰的短期分支，例如 `codex/fix-issue-template`。
 - 每个提交尽量只解决一个主题，提交信息使用简短的动词开头描述。
 - 提交前检查 `git status`，确认没有 `.env`、数据库、缓存、密钥或临时文件。
 - 不要重写他人正在使用的分支历史。

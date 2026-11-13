@@ -338,6 +338,16 @@ def test_duplicate_desired_identity_refused(case, monkeypatch, node):
         plan(case, monkeypatch)
 
 
+def test_device_scoped_vless_identity_is_accepted(case, monkeypatch):
+    stats_id = "f1d2-0123456789abn17v2"
+    case.desired[17]["users"][0]["stats_id"] = stats_id
+    case.configs[17]["inbounds"][0]["settings"]["clients"][0]["email"] = stats_id
+    sign_desired(case.desired[17])
+    write_configs(case)
+
+    plan(case, monkeypatch)
+
+
 @pytest.mark.parametrize("where", ["live", "desired"])
 def test_duplicate_xray_uuid_refused(case, monkeypatch, where):
     if where == "live":

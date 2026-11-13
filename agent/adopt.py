@@ -96,7 +96,11 @@ def validate_desired(spec, desired, agent_module):
     if any(u.get("protocol") != protocol for u in desired["users"]):
         raise AdoptionError("explicit protocol tags are required for adoption")
     if len(set(ids)) != len(ids) or any(
-        not re.fullmatch(rf"f[1-9]\d*n{node_id}v[1-9]\d*", x) for x in ids
+        not re.fullmatch(
+            rf"f[1-9]\d*(?:n|d[1-9]\d*-[0-9a-f]{{12}}n){node_id}v[1-9]\d*",
+            x,
+        )
+        for x in ids
     ):
         raise AdoptionError(
             "desired user identity is ambiguous or belongs to another node"

@@ -20,7 +20,12 @@ from sqlalchemy import select
 
 from app.account_policy import is_expired
 from app.converter import parse_uri
-from app.credentials import credential_stats_id, credential_values, deny_all_uuid
+from app.credentials import (
+    credential_scope_is_allowed,
+    credential_stats_id,
+    credential_values,
+    deny_all_uuid,
+)
 from app.models import Friend, Node, NodeAgent, UserNodeCredential, utcnow
 from app.quota import flow_limit_reached
 
@@ -194,6 +199,8 @@ def authenticate_hysteria(db, auth: str) -> str | None:
     # naive UTC while keeping utcnow() itself timezone-aware for API output.
     now = utcnow().replace(tzinfo=None)
     for row, friend in rows:
+        if not credential_scope_is_allowed(row, friend):
+            continue
         if is_expired(friend.expires_at):
             continue
         if flow_limit_reached(db, friend):
@@ -301,7 +308,7 @@ def _live_vless_rows(db, node_id: int, extra: UserNodeCredential | None = None):
         or is_expired(node.expires_at)
     ):
         return []
-    rows = db.scalars(
+    queried_rows = db.execute(
         select(UserNodeCredential, Friend)
         .join(Friend, Friend.id == UserNodeCredential.friend_id)
         .where(
@@ -313,6 +320,9 @@ def _live_vless_rows(db, node_id: int, extra: UserNodeCredential | None = None):
         )
         .order_by(UserNodeCredential.friend_id, UserNodeCredential.version)
     ).all()
+    rows = [
+        row for row, friend in queried_rows if credential_scope_is_allowed(row, friend)
+    ]
     now = utcnow().replace(tzinfo=None)
     result = [
         row
@@ -339,6 +349,7 @@ def _live_vless_rows(db, node_id: int, extra: UserNodeCredential | None = None):
         and extra.revoked_at is None
         and extra.friend.enabled
         and extra.friend.per_user_credentials
+        and credential_scope_is_allowed(extra)
         and not is_expired(extra.friend.expires_at)
         and not flow_limit_reached(db, extra.friend)
     ):
