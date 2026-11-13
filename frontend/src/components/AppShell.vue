@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api.js";
 import { isRealNode } from "../noc/data.js";
-import { auth } from "../store.js";
+import { auth, requestDataRefresh } from "../store.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -20,7 +20,8 @@ const lastSync = ref("");
 const navCounts = ref({});
 let timer;
 
-async function refreshSignal() {
+async function refreshSignal(refreshPage = true) {
+  if (refreshPage) requestDataRefresh();
   try {
     const [allNodes, stats] = await Promise.all([api.nodes(), api.stats()]);
     const nodes = (allNodes || []).filter(isRealNode);
@@ -47,8 +48,8 @@ async function logout() {
 }
 
 onMounted(() => {
-  refreshSignal();
-  timer = window.setInterval(refreshSignal, 30000);
+  refreshSignal(false);
+  timer = window.setInterval(() => refreshSignal(), 30000);
 });
 onUnmounted(() => window.clearInterval(timer));
 </script>
@@ -83,7 +84,7 @@ onUnmounted(() => window.clearInterval(timer));
         <h1><span class="tick">▍</span>{{ current }}</h1>
         <div class="top-actions">
           <span class="lbl">{{ lastSync || "—" }}</span>
-          <button class="b" aria-label="刷新节点在线状态" @click="refreshSignal">刷新</button>
+          <button class="b" aria-label="刷新面板数据" @click="refreshSignal">刷新</button>
         </div>
       </header>
       <div class="page"><slot /></div>

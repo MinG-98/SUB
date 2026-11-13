@@ -731,11 +731,12 @@ def _node_traffic_summary(db, node_id):
         since = now - timedelta(days=days)
         bytes_in, bytes_out = db.execute(
             select(
-                func.coalesce(func.sum(NodeMetricSample.delta_in), 0),
-                func.coalesce(func.sum(NodeMetricSample.delta_out), 0),
+                func.coalesce(func.sum(FlowRecord.bytes_in), 0),
+                func.coalesce(func.sum(FlowRecord.bytes_out), 0),
             ).where(
-                NodeMetricSample.node_id == node_id,
-                NodeMetricSample.bucket >= since,
+                FlowRecord.node_id == node_id,
+                FlowRecord.source.in_(("vless", "hysteria2")),
+                FlowRecord.bucket >= since,
             )
         ).one()
         bytes_in = int(bytes_in or 0)
@@ -746,6 +747,18 @@ def _node_traffic_summary(db, node_id):
             "total": bytes_in + bytes_out,
         }
     return result
+
+
+def _node_traffic_updated_at(db, node_id):
+    if db is None:
+        return None
+    latest = db.scalar(
+        select(func.max(FlowRecord.created_at)).where(
+            FlowRecord.node_id == node_id,
+            FlowRecord.source.in_(("vless", "hysteria2")),
+        )
+    )
+    return _iso(latest)
 
 
 def node_dict(n: Node, alloc_count: int = 0, db=None):
@@ -787,6 +800,8 @@ def node_dict(n: Node, alloc_count: int = 0, db=None):
         ),
         "allocated_to": alloc_count if real else 0,
         "collector": metric,
+        "traffic_source": "proxy_agent",
+        "traffic_updated_at": _node_traffic_updated_at(db, n.id),
         "traffic": (
             _node_traffic_summary(db, n.id)
             if n.enabled
@@ -830,34 +845,33 @@ def node_traffic(
     if days is None:
         raise HTTPException(400, "range 只能是 24h、7d 或 30d")
     since = utcnow() - timedelta(days=days)
-    rows = (
-        db.execute(
-            select(NodeMetricSample)
-            .where(
-                NodeMetricSample.node_id == node_id,
-                NodeMetricSample.bucket >= since.replace(tzinfo=None),
-            )
-            .order_by(NodeMetricSample.bucket)
+    rows = db.execute(
+        select(
+            FlowRecord.bucket,
+            func.coalesce(func.sum(FlowRecord.bytes_in), 0),
+            func.coalesce(func.sum(FlowRecord.bytes_out), 0),
         )
-        .scalars()
-        .all()
-    )
-    total_in = sum(row.delta_in for row in rows)
-    total_out = sum(row.delta_out for row in rows)
+        .where(
+            FlowRecord.node_id == node_id,
+            FlowRecord.source.in_(("vless", "hysteria2")),
+            FlowRecord.bucket >= since.replace(tzinfo=None),
+        )
+        .group_by(FlowRecord.bucket)
+        .order_by(FlowRecord.bucket)
+    ).all()
+    total_in = sum(int(row[1]) for row in rows)
+    total_out = sum(int(row[2]) for row in rows)
     return {
         "node": node_dict(node, db=db),
         "range": range,
         "totals": {"bytes_in": total_in, "bytes_out": total_out},
+        "source": "proxy_agent",
+        "updated_at": _node_traffic_updated_at(db, node_id),
         "points": [
             {
-                "at": _iso(row.bucket),
-                "online": row.online,
-                "bytes_in": row.delta_in,
-                "bytes_out": row.delta_out,
-                "net_in_transfer": row.net_in_transfer,
-                "net_out_transfer": row.net_out_transfer,
-                "net_in_speed": row.net_in_speed,
-                "net_out_speed": row.net_out_speed,
+                "at": _iso(row[0]),
+                "bytes_in": int(row[1]),
+                "bytes_out": int(row[2]),
             }
             for row in rows
         ],

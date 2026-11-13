@@ -1,4 +1,11 @@
-import { reactive } from "vue";
+import { reactive, ref } from "vue";
+
+// Lets the shell refresh the mounted view without resetting its local drafts.
+export const dataRefreshVersion = ref(0);
+
+export function requestDataRefresh() {
+  dataRefreshVersion.value += 1;
+}
 
 export const auth = reactive({
   checked: false,
