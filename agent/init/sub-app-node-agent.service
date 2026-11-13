@@ -1,5 +1,5 @@
 [Unit]
-Description=Sub App per-server node coordination agent
+Description=SUB per-server node coordination agent
 After=network-online.target sing-box.service
 Wants=network-online.target
 

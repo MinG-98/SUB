@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision one NEW standalone HY2 node using the existing SubApp admin API."""
+"""Provision one NEW standalone HY2 node using the existing SUB admin API."""
 
 import argparse
 import getpass
@@ -150,7 +150,7 @@ def wait_ready(api, node_id, previous=None, timeout=90):
 
 
 def canary(client, a, password):
-    with tempfile.TemporaryDirectory(prefix="subapp-client-") as d:
+    with tempfile.TemporaryDirectory(prefix="sub-client-") as d:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             proxy = f"127.0.0.1:{s.getsockname()[1]}"
@@ -346,7 +346,7 @@ def main():
     api(
         "POST",
         "/api/admin/login",
-        {"password": getpass.getpass("SubApp 管理员密码（仅发给美国控制面）：")},
+        {"password": getpass.getpass("SUB 管理员密码（仅发给控制面）：")},
     )
     try:
         provision(a, api)

@@ -119,6 +119,6 @@ def test_v16_migrates_legacy_placeholders_without_collisions_or_false_positives(
             versions = conn.exec_driver_sql(
                 "SELECT MAX(version) FROM schema_migrations"
             ).scalar_one()
-            assert versions == 16
+            assert versions == 17
     finally:
         engine.dispose()

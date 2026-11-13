@@ -42,16 +42,16 @@ jobs:
 
       - name: Frontend tests and production build
         working-directory: frontend
-        run: npm ci && npm test && npm run build -- --outDir "$RUNNER_TEMP/sub-app-ui-build"
+        run: npm ci && npm test && npm run build -- --outDir "$RUNNER_TEMP/sub-ui-build"
 
       - name: Assemble source and matching static assets
         run: |
-          release_dir="$RUNNER_TEMP/sub-app-release"
+          release_dir="$RUNNER_TEMP/sub-release"
           mkdir -p "$release_dir/static" "$release_dir/frontend"
           cp -R app agent scripts deploy README.md LICENSE pyproject.toml requirements.txt "$release_dir/"
           cp -R frontend/src frontend/public "$release_dir/frontend/"
           cp frontend/index.html frontend/package.json frontend/package-lock.json frontend/vite.config.js "$release_dir/frontend/"
-          cp -R "$RUNNER_TEMP/sub-app-ui-build/." "$release_dir/static/"
+          cp -R "$RUNNER_TEMP/sub-ui-build/." "$release_dir/static/"
           test -s "$release_dir/static/index.html"
           test -s "$release_dir/static/favicon.svg"
           test ! -e "$release_dir/frontend/node_modules"
@@ -60,7 +60,7 @@ jobs:
       - name: Upload non-deployed release candidate
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: sub-app-release-${{ github.sha }}
-          path: ${{ runner.temp }}/sub-app-release
+          name: sub-release-${{ github.sha }}
+          path: ${{ runner.temp }}/sub-release
           if-no-files-found: error
           retention-days: 7

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the Sub App SQLite backup daily
+Description=Run the SUB SQLite backup daily
 
 [Timer]
 OnCalendar=daily

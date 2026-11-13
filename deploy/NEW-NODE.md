@@ -6,7 +6,7 @@
 
 ## 先准备什么
 
-- 管理机：Python 3.10+、OpenSSH、SubApp 管理员登录权限。通过提供商控制台独立核对新机 SSH 指纹，把已验证的主机密钥放入当前账户的 known_hosts；非 22 端口使用 `[host]:port` 记录。脚本不接受未知指纹，不使用 SSH 别名，也不转发 SSH agent。
+- 管理机：Python 3.10+、OpenSSH、SUB 管理员登录权限。通过提供商控制台独立核对新机 SSH 指纹，把已验证的主机密钥放入当前账户的 known_hosts；非 22 端口使用 `[host]:port` 记录。脚本不接受未知指纹，不使用 SSH 别名，也不转发 SSH agent。
 - 新机：空白 Debian 12+ 或 Ubuntu 22.04+、systemd、root 公钥登录、系统自带 `/usr/bin/python3`（3.10+）、apt、OpenSSL、CA 根证书。支持 amd64 / arm64 和 IPv4；Alpine/OpenRC、IPv6-only、已运行 Xray/sing-box/Hy2 的机器不适用。下载及安装需要至少 150 MiB 可用磁盘。极低内存小鸡还需单独评估运行余量。
 - NAT 面板/防火墙先放行 **公网 UDP → 本机 UDP**。SSH、Hy2、签证书用的端口互相独立；控制面只需出站 HTTPS。脚本不改 SSH、防火墙、端口映射、DNS 或系统网络参数。目标机还需能访问软件源和 GitHub 发布物。
 - TLS 二选一：① 目标已有公网信任的完整证书链与匹配私钥，均在目标机 `/etc/` 下，并有自己的续期方案；② 新域名已解析到本机且公网 **TCP 80 → 本机 80**，使用 `--acme-email` 让 Hy2 通过 HTTP-01 申请/续期。只有 UDP 的 NAT 机请选择①，例如提前用 DNS-01 签发证书。不要传私钥内容、订阅 token 或管理员密码作为参数。
@@ -25,7 +25,7 @@ python3 scripts/bootstrap_node.py \
   --key /etc/letsencrypt/live/hy2.example.net/privkey.pem
 ```
 
-名称由 SubApp 已有最大两位节点序号自动递增；例如线上当前最高序号是 `15`，新加坡 Hy2 会显示为 `16｜🇸🇬 新加坡 Hy2`。支持的地区代码：`DE`、`HK`、`JP`、`KR`、`MY`、`SG`、`US`。同一控制面请串行运行部署，避免两个并发新节点争用序号。
+名称由 SUB 已有最大两位节点序号自动递增；例如当前最高序号是 `15`，新加坡 Hy2 会显示为 `16｜🇸🇬 新加坡 Hy2`。支持的地区代码：`DE`、`HK`、`JP`、`KR`、`MY`、`SG`、`US`。同一控制面请串行运行部署，避免两个并发新节点争用序号。
 
 订阅生成时始终把管理面板的节点名写入 URI 的标准名称片段；现有 URI 片段为空或过期，也会在 raw、V2Ray/小火箭 Base64 与 Clash/Mihomo 订阅中显示管理面板的规范名。数据库内原 URI 不会被批量改写。
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import func, select
 
 from app.account_policy import is_expired
-from app.credentials import credential_stats_id
+from app.credentials import credential_scope_is_allowed, credential_stats_id
 from app.models import FlowRecord, Friend, Node, UserNodeCredential
 
 
@@ -52,7 +52,7 @@ def quota_exceeded_stats_ids(db, node_id: int, protocol: str) -> list[str]:
     ids = {
         credential_stats_id(row)
         for row, friend in rows
-        if flow_limit_reached(db, friend)
+        if credential_scope_is_allowed(row, friend) and flow_limit_reached(db, friend)
     }
     return sorted(ids)
 
@@ -88,6 +88,7 @@ def credential_kick_stats_ids(db, node_id: int, protocol: str) -> list[str]:
             or row.revoked_at is not None
             or not friend.enabled
             or not friend.per_user_credentials
+            or not credential_scope_is_allowed(row, friend)
             or is_expired(friend.expires_at)
             or row.status not in {"active", "grace"}
             or grace_expired

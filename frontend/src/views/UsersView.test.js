@@ -134,3 +134,30 @@ test("diagnostics template compiles, separates admission from eligibility, and h
   assert.doesNotMatch(modal, /copyText|clipboard|v-html|\.token|\.links|JSON\.stringify/);
   assert.equal(descriptor.styles.length, 0);
 });
+
+test("device credential transition endpoints are explicit POST actions", async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (path, options) => {
+    calls.push({ path, options });
+    return new Response(JSON.stringify({ ok: true, mode: "preparing" }));
+  });
+  await api.prepareDeviceCredentials(4);
+  await api.activateDeviceCredentials(4);
+  await api.restoreCompatibleCredentials(4);
+  assert.deepEqual(calls.map(({ path, options }) => [path, options.method]), [
+    ["/api/admin/friends/4/device-credentials/prepare", "POST"],
+    ["/api/admin/friends/4/device-credentials/activate", "POST"],
+    ["/api/admin/friends/4/device-credentials/restore", "POST"],
+  ]);
+});
+
+test("user template exposes safe staged device isolation and separates credential scopes", () => {
+  const result = compileTemplate({ source: descriptor.template.content, filename: "UsersView.vue", id: "users-test", compilerOptions: { bindingMetadata: script.bindings } });
+  assert.deepEqual(result.errors, []);
+  assert.match(source, /准备设备级凭据/);
+  assert.match(source, /启用严格隔离/);
+  assert.match(source, /恢复兼容订阅/);
+  assert.match(descriptor.template.content, /不是硬件指纹认证/);
+  assert.match(descriptor.template.content, /:key="scope\.key"/);
+  assert.match(descriptor.template.content, /scope\.scopeLabel/);
+});

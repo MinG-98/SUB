@@ -31,7 +31,7 @@ async function submit() {
 <template>
   <main class="login-screen">
     <section class="login-card">
-      <div class="login-brand"><b>SA Console</b></div>
+      <div class="login-brand"><b>SUB</b></div>
 
       <form class="login-form" @submit.prevent="submit">
         <span class="lbl lbl-am">Operator access</span>

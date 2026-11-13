@@ -158,6 +158,7 @@ class Friend(Base):
     flow_limit_gb = Column(Integer, default=0, nullable=False)
     device_limit = Column(Integer, default=0, nullable=False)
     per_user_credentials = Column(Boolean, default=False, nullable=False)
+    device_credentials_mode = Column(String(16), default="off", nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
     expires_at = Column(DateTime)
@@ -246,6 +247,7 @@ class Device(Base):
     __tablename__ = "devices"
     __table_args__ = (
         UniqueConstraint("friend_id", "fingerprint", name="uq_friend_fingerprint"),
+        UniqueConstraint("credential_scope", name="uq_device_credential_scope"),
     )
 
     id = Column(Integer, primary_key=True)
@@ -253,6 +255,11 @@ class Device(Base):
         Integer, ForeignKey("friends.id", ondelete="CASCADE"), nullable=False
     )
     fingerprint = Column(String(64), nullable=False)
+    # Immutable random scope prevents credential reuse if a deleted SQLite row id
+    # is later reused. It is deliberately not exposed through admin responses.
+    credential_scope = Column(
+        String(64), default=lambda: secrets.token_hex(24), nullable=False
+    )
     device_token_hash = Column(String(128), unique=True)
     identity_source = Column(String(32), default="legacy_ua_ip", nullable=False)
     device_token_created_at = Column(DateTime)
@@ -392,6 +399,7 @@ class UserNodeCredential(Base):
     node_id = Column(
         Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False
     )
+    device_id = Column(Integer, ForeignKey("devices.id", ondelete="CASCADE"))
     protocol = Column(String(32), nullable=False)
     credential_name = Column(String(128), nullable=False)
     version = Column(Integer, default=1, nullable=False)
@@ -405,6 +413,7 @@ class UserNodeCredential(Base):
 
     friend = relationship("Friend", back_populates="credentials")
     node = relationship("Node", back_populates="credentials")
+    device = relationship("Device")
 
 
 def _table_exists(conn, table_name):
@@ -893,6 +902,45 @@ def migrate_database(engine):
                             "JOIN announcements AS n ON n.legacy_node_id=a.node_id"
                         )
             _mark_migration(conn, 16)
+
+        if current < 17:
+            if _table_exists(conn, "friends") and not _column_exists(
+                conn, "friends", "device_credentials_mode"
+            ):
+                conn.exec_driver_sql(
+                    "ALTER TABLE friends ADD COLUMN device_credentials_mode "
+                    "VARCHAR(16) NOT NULL DEFAULT 'off'"
+                )
+            if _table_exists(conn, "devices"):
+                if not _column_exists(conn, "devices", "credential_scope"):
+                    conn.exec_driver_sql(
+                        "ALTER TABLE devices ADD COLUMN credential_scope "
+                        "VARCHAR(64) NOT NULL DEFAULT ''"
+                    )
+                for (device_id,) in conn.exec_driver_sql(
+                    "SELECT id FROM devices WHERE credential_scope=''"
+                ).all():
+                    conn.exec_driver_sql(
+                        "UPDATE devices SET credential_scope=? WHERE id=?",
+                        (secrets.token_hex(24), device_id),
+                    )
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_device_credential_scope "
+                    "ON devices(credential_scope)"
+                )
+            if _table_exists(conn, "user_node_credentials") and not _column_exists(
+                conn, "user_node_credentials", "device_id"
+            ):
+                conn.exec_driver_sql(
+                    "ALTER TABLE user_node_credentials ADD COLUMN device_id "
+                    "INTEGER REFERENCES devices(id) ON DELETE CASCADE"
+                )
+            if _table_exists(conn, "user_node_credentials"):
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_user_node_credentials_device_node "
+                    "ON user_node_credentials(device_id, node_id, protocol, status)"
+                )
+            _mark_migration(conn, 17)
 
 
 def make_session_factory(db_path):

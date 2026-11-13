@@ -1,5 +1,5 @@
 [Unit]
-Description=Create a verified Sub App SQLite backup (root-owned deployment)
+Description=Create a verified SUB SQLite backup (root-owned deployment)
 After=local-fs.target
 
 [Service]

@@ -41,7 +41,9 @@ class SubscriptionPlan:
     announcement_count: int = 0
 
 
-def build_subscription_plan(db, friend, feature_enabled: bool) -> SubscriptionPlan:
+def build_subscription_plan(
+    db, friend, feature_enabled: bool, device_id: int | None = None
+) -> SubscriptionPlan:
     """Select exactly the material delivered to an admitted device; never write."""
     plan = SubscriptionPlan()
     nodes = db.scalars(
@@ -62,6 +64,7 @@ def build_subscription_plan(db, friend, feature_enabled: bool) -> SubscriptionPl
         )
     ).all()
     items = []
+    device_mode = getattr(friend, "device_credentials_mode", "off") or "off"
     for node in nodes:
         if not is_real_node(node):
             continue
@@ -88,23 +91,61 @@ def build_subscription_plan(db, friend, feature_enabled: bool) -> SubscriptionPl
             and adapter_info(node)
             and node_per_user_enabled(node)
         )
-        if use_per_user:
-            row = db.scalar(
-                select(UserNodeCredential)
-                .where(
-                    UserNodeCredential.friend_id == friend.id,
-                    UserNodeCredential.node_id == node.id,
-                    UserNodeCredential.protocol == node.protocol,
-                    UserNodeCredential.revoked_at.is_(None),
-                    UserNodeCredential.status == "active",
-                )
-                .order_by(UserNodeCredential.version.desc())
-                .limit(1)
+        if device_mode == "required" and not use_per_user:
+            plan.skipped_nodes.append(node.id)
+            metadata.update(
+                code="device_credential_unavailable",
+                message="此节点无法提供设备独立凭据，已安全跳过",
             )
+            continue
+        if use_per_user:
+            row = None
+            try_device_row = device_id is not None and device_mode in {
+                "preparing",
+                "required",
+                "restoring",
+            }
+            if try_device_row:
+                row = db.scalar(
+                    select(UserNodeCredential)
+                    .where(
+                        UserNodeCredential.friend_id == friend.id,
+                        UserNodeCredential.device_id == device_id,
+                        UserNodeCredential.node_id == node.id,
+                        UserNodeCredential.protocol == node.protocol,
+                        UserNodeCredential.revoked_at.is_(None),
+                        UserNodeCredential.status == "active",
+                    )
+                    .order_by(UserNodeCredential.version.desc())
+                    .limit(1)
+                )
+            if row is None and device_mode != "required":
+                row = db.scalar(
+                    select(UserNodeCredential)
+                    .where(
+                        UserNodeCredential.friend_id == friend.id,
+                        UserNodeCredential.device_id.is_(None),
+                        UserNodeCredential.node_id == node.id,
+                        UserNodeCredential.protocol == node.protocol,
+                        UserNodeCredential.revoked_at.is_(None),
+                        UserNodeCredential.status == "active",
+                    )
+                    .order_by(UserNodeCredential.version.desc())
+                    .limit(1)
+                )
             if row is None:
                 plan.skipped_nodes.append(node.id)
                 metadata.update(
-                    code="credential_unavailable", message="没有匹配协议的已生效凭据"
+                    code=(
+                        "device_credential_unavailable"
+                        if device_mode == "required"
+                        else "credential_unavailable"
+                    ),
+                    message=(
+                        "没有匹配设备的已生效凭据"
+                        if device_mode == "required"
+                        else "没有匹配协议的已生效凭据"
+                    ),
                 )
                 continue
             metadata.update(

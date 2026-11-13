@@ -18,7 +18,11 @@ from sqlalchemy.exc import IntegrityError
 
 from app.account_policy import is_expired
 from app.converter import parse_uri
-from app.credentials import credential_stats_id, credential_values
+from app.credentials import (
+    credential_scope_is_allowed,
+    credential_stats_id,
+    credential_values,
+)
 from app.models import (
     FlowRecord,
     Friend,
@@ -160,6 +164,8 @@ def _desired_users(db, node_id: int) -> list[dict]:
     ).all()
     result = []
     for row, friend in rows:
+        if not credential_scope_is_allowed(row, friend):
+            continue
         if is_expired(friend.expires_at) or flow_limit_reached(db, friend):
             continue
         if row.status == "grace" and (
@@ -287,7 +293,11 @@ def _record_traffic(db, node_id: int, payload) -> tuple[int, list[str]]:
             Friend.per_user_credentials.is_(True),
         )
     ).all()
-    by_key = {credential_stats_id(row): row for row in rows}
+    by_key = {
+        credential_stats_id(row): row
+        for row in rows
+        if credential_scope_is_allowed(row)
+    }
     node = db.get(Node, node_id)
     info = adapter_info(node) if node else None
     expected_source = info.get("source") if info else None
@@ -320,7 +330,7 @@ def _record_traffic(db, node_id: int, payload) -> tuple[int, list[str]]:
             .values(
                 node_id=node_id,
                 friend_id=row.friend_id,
-                device_id=None,
+                device_id=row.device_id,
                 bytes_in=_safe_int(item.get("bytes_in")),
                 bytes_out=_safe_int(item.get("bytes_out")),
                 bucket=bucket,
